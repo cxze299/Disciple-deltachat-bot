@@ -125,11 +125,43 @@ class MenxunBotTests(unittest.TestCase):
         send.assert_called_once_with(fake_bot, 1, 900, "打卡成功\n已通知 2 个群。")
 
     def test_help_keeps_status_commands_explicit(self):
-        text = bot.help_text(self.site)
+        other_site = bot.SiteConfig(site_id="other", name="其他网站", url="https://other.test", chat_ids=frozenset())
+        with patch.object(bot, "SITES", (self.site, other_site)), patch.object(bot, "DEFAULT_SITE", self.site):
+            text = bot.help_text(self.site)
+        self.assertIn("首次使用（请私聊）", text)
+        self.assertIn("网站 — 查看可用网站", text)
+        self.assertIn(f"绑定 {self.site.site_id} 你的姓名", text)
+        self.assertIn("日常打卡", text)
         self.assertIn("我的状态 — 查看个人完成情况", text)
         self.assertIn("群状态 — 查看全群完成情况", text)
         self.assertNotIn("使用指令（按重要顺序）", text)
         self.assertNotIn("/", text)
+
+    def test_site_list_includes_complete_private_onboarding(self):
+        other_site = bot.SiteConfig(site_id="other", name="其他网站", url="https://other.test", chat_ids=frozenset())
+        with patch.object(bot, "SITES", (self.site, other_site)), patch.object(bot, "DEFAULT_SITE", self.site):
+            text = bot.site_list_text()
+        self.assertIn("首次使用（请私聊机器人）", text)
+        self.assertIn(f"切换 {self.site.site_id}", text)
+        self.assertIn(f"绑定 {self.site.site_id} 你的姓名", text)
+        self.assertIn("打卡 灵修", text)
+
+    def test_private_welcome_is_sent_only_once(self):
+        fake_bot = SimpleNamespace()
+        temporary_state = {"welcomed": {}, "bindings": {}, "active_sites": {}, "checkins": {}, "reminded": {}, "admins": {}}
+        with patch.object(bot, "state", temporary_state), patch.object(bot, "save_state"), patch.object(bot, "send") as send:
+            self.assertTrue(bot.send_private_welcome_once(fake_bot, 1, 900, 42, False))
+            self.assertFalse(bot.send_private_welcome_once(fake_bot, 1, 900, 42, False))
+        send.assert_called_once_with(fake_bot, 1, 900, bot.welcome_text())
+        self.assertIn("42", temporary_state["welcomed"])
+
+    def test_private_welcome_skips_groups_and_special_contacts(self):
+        fake_bot = SimpleNamespace()
+        temporary_state = {"welcomed": {}, "bindings": {}, "active_sites": {}, "checkins": {}, "reminded": {}, "admins": {}}
+        with patch.object(bot, "state", temporary_state), patch.object(bot, "save_state"), patch.object(bot, "send") as send:
+            self.assertFalse(bot.send_private_welcome_once(fake_bot, 1, 900, 42, True))
+            self.assertFalse(bot.send_private_welcome_once(fake_bot, 1, 900, 5, False))
+        send.assert_not_called()
 
     def test_checkin_retro_and_cancel_use_the_same_task_names(self):
         self.assertEqual(bot.parse_task_kind("灵修"), "每日灵修")

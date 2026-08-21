@@ -179,8 +179,11 @@ def load_state() -> dict:
     loaded.setdefault("bindings", {})
     loaded.setdefault("active_sites", {})
     loaded.setdefault("admins", {})
+    loaded.setdefault("welcomed", {})
     if not isinstance(loaded["admins"], dict):
         loaded["admins"] = {}
+    if not isinstance(loaded["welcomed"], dict):
+        loaded["welcomed"] = {}
     return loaded
 
 
@@ -250,6 +253,34 @@ def safe_log_text(raw_text: str) -> str:
 
 def send(bot, accid: int, chat_id: int, text: str) -> None:
     bot.rpc.send_msg(accid, chat_id, MessageData(text=text))
+
+
+def welcome_text() -> str:
+    return "\n".join([
+        f"你好，欢迎使用{BOT_NAME}。",
+        "",
+        "首次使用（请在这里私聊操作）",
+        "1. 发送：网站",
+        "2. 发送：切换 网站代号",
+        "3. 发送：绑定 网站代号 你的姓名",
+        "4. 发送：打卡 灵修",
+        "",
+        "发送“帮助”可查看全部指令。",
+    ])
+
+
+def send_private_welcome_once(bot, accid: int, chat_id: int, member_id: int, is_group: bool) -> bool:
+    """在账号首次与机器人建立私聊后发送一次引导。"""
+    if is_group or member_id <= 9:
+        return False
+    member_key = str(member_id)
+    with state_lock:
+        if state["welcomed"].get(member_key):
+            return False
+        send(bot, accid, chat_id, welcome_text())
+        state["welcomed"][member_key] = datetime.now().astimezone().isoformat()
+        save_state()
+    return True
 
 
 def fetch_json(site: SiteConfig, path: str) -> dict:
@@ -501,26 +532,36 @@ def task_summary(config: dict, today: date | None = None, site: SiteConfig | Non
 
 def help_text(site: SiteConfig | None = None) -> str:
     lines = [
-        f"{BOT_NAME} · 指令菜单",
+        f"{BOT_NAME} · 帮助",
         "",
-        "打卡 [项目] — 完成打卡",
-        "补签 [项目] 日期 — 补签指定日期",
-        "取消打卡 [项目] [日期] — 取消打卡",
-        "项目：灵修、周读物、视频、背经",
-        "日期：2026-08-20、昨天、前天",
+    ]
+    if len(SITES) > 1:
+        lines.extend([
+            "首次使用（请私聊）",
+            "1. 网站 — 查看可用网站",
+            f"2. 切换 {DEFAULT_SITE.site_id} — 选择网站",
+            f"3. 绑定 {DEFAULT_SITE.site_id} 你的姓名 — 绑定身份",
+            "",
+        ])
+    else:
+        lines.extend(["首次使用（请私聊）", "绑定 你的姓名 — 绑定身份", ""])
+    lines.extend([
+        "日常打卡",
+        "打卡 灵修",
+        "打卡 周读物",
+        "打卡 视频",
+        "打卡 背经",
+        "补签 项目 日期",
+        "取消打卡 项目 日期",
         "",
+        "查看进度",
         "我的状态 — 查看个人完成情况",
         "群状态 — 查看全群完成情况",
         "任务 — 查看今日和本周任务",
         "",
-        "绑定 姓名 — 绑定身份（请私聊）",
-    ]
-    if len(SITES) > 1:
-        lines.extend([
-            "网站 — 查看网站列表",
-            "切换 网站代号 — 切换私聊网站",
-        ])
-    lines.extend(["", "管理员帮助 — 查看管理员指令", "帮助 — 查看指令菜单"])
+        "日期可填写：2026-08-20、昨天、前天",
+        "管理员帮助 — 查看管理员指令",
+    ])
     return "\n".join(lines)
 
 
@@ -579,12 +620,18 @@ def site_list_text(member_id: int = 0) -> str:
                 active_id = configured[0]
         if not active_id and len(SITES) == 1:
             active_id = DEFAULT_SITE.site_id
-    lines = ["🌐 已配置的门训网站："]
+    lines = ["🌐 请选择门训网站："]
     for site in SITES:
         marker = " ✅" if site.site_id == active_id else ""
         lines.append(f"· {site.site_id} —— {site.name}{marker}")
-    lines.append(f"私聊切换示例：切换 {DEFAULT_SITE.site_id}")
-    lines.append(f"多网站绑定示例：绑定 {DEFAULT_SITE.site_id} 张迦勒")
+    lines.extend([
+        "",
+        "首次使用（请私聊机器人）：",
+        f"1. 切换 {DEFAULT_SITE.site_id}",
+        f"2. 绑定 {DEFAULT_SITE.site_id} 你的姓名",
+        "3. 打卡 灵修",
+        "把示例中的网站代号换成你所在网站的代号。",
+    ])
     return "\n".join(lines)
 
 
@@ -1033,12 +1080,13 @@ def on_new_message(bot, accid: int, event) -> None:
     raw_text = (msg.text or "").strip()
     command_text = raw_text
     text = command_text.rstrip("！!。.").lower()
-    if not text:
-        return
-    bot.logger.info("收到消息：chat_id=%s text=%r", chat_id, safe_log_text(raw_text))
     is_group, site = resolve_message_site(bot, accid, chat_id, member_id)
 
     try:
+        send_private_welcome_once(bot, accid, chat_id, member_id, is_group)
+        if not text:
+            return
+        bot.logger.info("收到消息：chat_id=%s text=%r", chat_id, safe_log_text(raw_text))
         if handle_admin_command(bot, accid, chat_id, member_id, is_group, site, command_text):
             return
         if text in {"帮助", "菜单"}:
@@ -1080,7 +1128,7 @@ def on_new_message(bot, accid: int, event) -> None:
             if is_group:
                 send(bot, accid, chat_id, f"这个群尚未关联门训网站，日志中的 chat_id={chat_id}。请把它加入 sites.json。")
             else:
-                send(bot, accid, chat_id, "你还没有选择私聊网站。请发送“网站”，然后发送“切换 网站代号”。")
+                send(bot, accid, chat_id, "你还没有选择门训网站。\n请先发送“网站”，再按提示完成切换和绑定。")
             return
         if text in {"任务", "今日", "今天", "本周"}:
             _, config = website_snapshot(site)
