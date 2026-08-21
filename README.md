@@ -83,7 +83,7 @@ runtime/config/sites.json
     {
       "id": "group1",
       "name": "第一门训小组",
-      "url": "https://your-nas.example.com:1777",
+      "url": "https://your-nas.example.com:ports",
       "chat_ids": [],
       "timezone": "Asia/Shanghai",
       "morning_time": "08:30",
