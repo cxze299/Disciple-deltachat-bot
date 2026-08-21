@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.log
+
+.env
+/sites.json
+/config/
+
+/data/
+/runtime/config/*
+!/runtime/config/.gitkeep
+/runtime/data/*
+!/runtime/data/.gitkeep
+
+node_modules/
+deltachat-rpc-server.exe

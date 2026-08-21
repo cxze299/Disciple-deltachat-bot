@@ -1,0 +1,14 @@
+{
+  "sites": [
+    {
+      "id": "group1",
+      "name": "第一门训小组",
+      "url": "https://your-nas.example.com:1777",
+      "chat_ids": [],
+      "timezone": "Asia/Shanghai",
+      "morning_time": "08:30",
+      "evening_time": "20:30",
+      "enabled": true
+    }
+  ]
+}

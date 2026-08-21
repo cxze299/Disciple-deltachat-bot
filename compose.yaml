@@ -1,0 +1,25 @@
+name: menxun-deltachat-bot
+
+services:
+  menxun-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: menxun-deltachat-bot:local
+    container_name: menxun-deltachat-bot
+    restart: unless-stopped
+    init: true
+    environment:
+      BOT_NAME: "${BOT_NAME:-门训同行}"
+      BOT_TIMEZONE: "${BOT_TIMEZONE:-Asia/Shanghai}"
+      MENXUN_DATA_DIR: /data
+      MENXUN_SITES_FILE: /config/sites.json
+      MENXUN_ADMIN_KEY_FILE: /data/admin-key.json
+    volumes:
+      - ./runtime/config:/config
+      - ./runtime/data:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

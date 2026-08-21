@@ -1,0 +1,14 @@
+.git
+.github
+.venv
+__pycache__
+*.py[cod]
+*.log
+.env
+runtime
+data
+config
+node_modules
+deltachat-rpc-server.exe
+sites.json
+start-menxun-bot.ps1
