@@ -1,6 +1,6 @@
 # 门训同行 Delta Chat Bot
 
-[![CI](https://github.com/cxze299/menxun-deltachat-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/cxze299/menxun-deltachat-bot/actions/workflows/ci.yml)
+[![CI](https://github.com/cxze299/Disciple-deltachat-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/cxze299/Disciple-deltachat-bot/actions/workflows/ci.yml)
 
 面向 Delta Chat / Chatmail 的门训打卡机器人。支持多网站、多群提醒、私聊打卡、补签、取消打卡、状态查询和一次验证的管理员体系。
 
@@ -21,7 +21,7 @@
 ## 项目结构
 
 ```text
-menxun-deltachat-bot/
+Disciple-deltachat-bot/
 ├─ menxun_bot.py           机器人主程序
 ├─ admin_key.py            管理员密钥哈希与验证
 ├─ set_admin_key.py        管理员密钥设置工具
@@ -41,15 +41,15 @@ menxun-deltachat-bot/
 ### 1. 下载项目
 
 ```powershell
-git clone https://github.com/cxze299/menxun-deltachat-bot.git
-cd menxun-deltachat-bot
+git clone https://github.com/cxze299/Disciple-deltachat-bot.git
+cd Disciple-deltachat-bot
 ```
 
 Linux 或 NAS：
 
 ```bash
-git clone https://github.com/cxze299/menxun-deltachat-bot.git
-cd menxun-deltachat-bot
+git clone https://github.com/cxze299/Disciple-deltachat-bot.git
+cd Disciple-deltachat-bot
 chmod +x manage.sh
 ```
 

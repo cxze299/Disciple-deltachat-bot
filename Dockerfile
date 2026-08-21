@@ -2,7 +2,7 @@ FROM python:3.12-slim-bookworm
 
 LABEL org.opencontainers.image.title="Menxun Delta Chat Bot" \
       org.opencontainers.image.description="多网站门训打卡、提醒与管理员服务" \
-      org.opencontainers.image.source="https://github.com/cxze299/menxun-deltachat-bot"
+      org.opencontainers.image.source="https://github.com/cxze299/Disciple-deltachat-bot"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
