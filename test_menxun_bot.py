@@ -129,8 +129,8 @@ class MenxunBotTests(unittest.TestCase):
         with patch.object(bot, "SITES", (self.site, other_site)), patch.object(bot, "DEFAULT_SITE", self.site):
             text = bot.help_text(self.site)
         self.assertIn("首次使用（请私聊）", text)
-        self.assertIn("网站 — 查看可用网站", text)
-        self.assertIn(f"绑定 {self.site.site_id} 你的姓名", text)
+        self.assertIn("直接回复你所在的网站名称", text)
+        self.assertIn("绑定 你的姓名", text)
         self.assertIn("日常打卡", text)
         self.assertIn("我的状态 — 查看个人完成情况", text)
         self.assertIn("群状态 — 查看全群完成情况", text)
@@ -141,10 +141,19 @@ class MenxunBotTests(unittest.TestCase):
         other_site = bot.SiteConfig(site_id="other", name="其他网站", url="https://other.test", chat_ids=frozenset())
         with patch.object(bot, "SITES", (self.site, other_site)), patch.object(bot, "DEFAULT_SITE", self.site):
             text = bot.site_list_text()
-        self.assertIn("首次使用（请私聊机器人）", text)
-        self.assertIn(f"切换 {self.site.site_id}", text)
-        self.assertIn(f"绑定 {self.site.site_id} 你的姓名", text)
-        self.assertIn("打卡 灵修", text)
+        self.assertIn("请选择门训网站", text)
+        self.assertIn("直接回复上面的网站名称", text)
+        self.assertNotIn("网站代号", text)
+
+    def test_find_site_accepts_friendly_chinese_names(self):
+        sites = (
+            bot.SiteConfig(site_id="zk", name="科大门训打卡", url="https://zk.test", chat_ids=frozenset()),
+            bot.SiteConfig(site_id="tianlu", name="天路历程门训打卡", url="https://tianlu.test", chat_ids=frozenset()),
+        )
+        by_id = {site.site_id: site for site in sites}
+        with patch.object(bot, "SITES", sites), patch.object(bot, "SITE_BY_ID", by_id):
+            self.assertEqual(bot.find_site("科大").site_id, "zk")
+            self.assertEqual(bot.find_site("天路历程").site_id, "tianlu")
 
     def test_private_welcome_is_sent_only_once(self):
         fake_bot = SimpleNamespace()

@@ -261,8 +261,8 @@ def welcome_text() -> str:
         "",
         "首次使用（请在这里私聊操作）",
         "1. 发送：网站",
-        "2. 发送：切换 网站代号",
-        "3. 发送：绑定 网站代号 你的姓名",
+        "2. 直接回复你所在的网站名称",
+        "3. 发送：绑定 你的姓名",
         "4. 发送：打卡 灵修",
         "",
         "发送“帮助”可查看全部指令。",
@@ -538,9 +538,9 @@ def help_text(site: SiteConfig | None = None) -> str:
     if len(SITES) > 1:
         lines.extend([
             "首次使用（请私聊）",
-            "1. 网站 — 查看可用网站",
-            f"2. 切换 {DEFAULT_SITE.site_id} — 选择网站",
-            f"3. 绑定 {DEFAULT_SITE.site_id} 你的姓名 — 绑定身份",
+            "1. 发送“网站”",
+            "2. 直接回复你所在的网站名称",
+            "3. 发送“绑定 你的姓名”",
             "",
         ])
     else:
@@ -623,21 +623,43 @@ def site_list_text(member_id: int = 0) -> str:
     lines = ["🌐 请选择门训网站："]
     for site in SITES:
         marker = " ✅" if site.site_id == active_id else ""
-        lines.append(f"· {site.site_id} —— {site.name}{marker}")
+        lines.append(f"· {site_choice_name(site)}{marker}")
     lines.extend([
         "",
-        "首次使用（请私聊机器人）：",
-        f"1. 切换 {DEFAULT_SITE.site_id}",
-        f"2. 绑定 {DEFAULT_SITE.site_id} 你的姓名",
-        "3. 打卡 灵修",
-        "把示例中的网站代号换成你所在网站的代号。",
+        "请直接回复上面的网站名称。",
+        "例如：科大",
+        "",
+        "选择后，机器人会告诉你下一步怎么做。",
     ])
     return "\n".join(lines)
 
 
+def site_choice_name(site: SiteConfig) -> str:
+    return {
+        "zk": "科大",
+        "agape": "Agape",
+        "zhewai": "浙外",
+        "longway": "Longway",
+        "tianlu": "天路历程",
+    }.get(site.site_id, site.name)
+
+
 def find_site(value: str) -> SiteConfig | None:
     clean = value.strip().lower()
-    return SITE_BY_ID.get(clean) or next((site for site in SITES if site.name.lower() == clean), None)
+    alias_id = {
+        "科大": "zk",
+        "科大门训": "zk",
+        "agape": "agape",
+        "浙外": "zhewai",
+        "浙外门训": "zhewai",
+        "longway": "longway",
+        "天路": "tianlu",
+        "天路历程": "tianlu",
+    }.get(clean)
+    return SITE_BY_ID.get(clean) or SITE_BY_ID.get(alias_id or "") or next(
+        (site for site in SITES if site.name.lower() == clean),
+        None,
+    )
 
 
 def parse_binding(text: str, current_site: SiteConfig | None) -> tuple[SiteConfig | None, str]:
@@ -1095,6 +1117,18 @@ def on_new_message(bot, accid: int, event) -> None:
         if text in {"网站", "网站列表", "站点"}:
             send(bot, accid, chat_id, site_list_text(member_id))
             return
+        directly_selected = find_site(command_text) if not is_group else None
+        if directly_selected:
+            with state_lock:
+                state["active_sites"][str(member_id)] = directly_selected.site_id
+                save_state()
+            send(
+                bot,
+                accid,
+                chat_id,
+                f"✅ 已选择：{directly_selected.name}\n\n下一步请发送：绑定 你的姓名\n例如：绑定 张三",
+            )
+            return
         if text.startswith("切换 ") or text.startswith("切换:") or text.startswith("切换："):
             if is_group:
                 send(bot, accid, chat_id, "群聊已由群 ID 自动关联网站，不需要切换。")
@@ -1107,7 +1141,7 @@ def on_new_message(bot, accid: int, event) -> None:
             with state_lock:
                 state["active_sites"][str(member_id)] = selected.site_id
                 save_state()
-            send(bot, accid, chat_id, f"已切换到：{selected.name}（{selected.site_id}）")
+            send(bot, accid, chat_id, f"✅ 已选择：{selected.name}\n\n下一步请发送：绑定 你的姓名\n例如：绑定 张三")
             return
         if text.startswith("绑定 ") or text.startswith("绑定:") or text.startswith("绑定："):
             if is_group:
@@ -1115,7 +1149,7 @@ def on_new_message(bot, accid: int, event) -> None:
                 return
             binding_site, name = parse_binding(command_text, site)
             if not binding_site:
-                send(bot, accid, chat_id, f"请指定网站，例如：绑定 {DEFAULT_SITE.site_id} 张迦勒\n" + site_list_text(member_id))
+                send(bot, accid, chat_id, "请先发送“网站”，再直接回复你所在的网站名称。")
                 return
             website_state, _ = website_snapshot(binding_site)
             members = [str(item).strip() for item in website_state.get("members") or []]
