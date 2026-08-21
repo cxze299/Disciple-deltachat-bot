@@ -133,6 +133,7 @@ class MenxunBotTests(unittest.TestCase):
         self.assertIn("绑定 你的姓名", text)
         self.assertIn("日常打卡", text)
         self.assertIn("我的状态 — 查看个人完成情况", text)
+        self.assertIn("我的月状态 — 查看个人本月月历", text)
         self.assertIn("群状态 — 查看全群完成情况", text)
         self.assertNotIn("使用指令（按重要顺序）", text)
         self.assertNotIn("/", text)
@@ -154,6 +155,27 @@ class MenxunBotTests(unittest.TestCase):
         with patch.object(bot, "SITES", sites), patch.object(bot, "SITE_BY_ID", by_id):
             self.assertEqual(bot.find_site("科大").site_id, "zk")
             self.assertEqual(bot.find_site("天路历程").site_id, "tianlu")
+
+    def test_member_month_status_matches_website_profile_calendar_rules(self):
+        website_state = {
+            "records": [
+                {"name": "张迦勒", "logical_date": "2026-08-18", "book": "done"},
+                {"name": "张迦勒", "logical_date": "2026-08-20", "daily": "done"},
+                {"name": "张迦勒", "logical_date": "2026-08-19", "video": "done"},
+            ],
+            "weeklySchedule": self.schedule,
+        }
+        with patch.object(bot, "website_snapshot", return_value=(website_state, {"weekly_schedule": self.schedule})):
+            text = bot.member_month_status(self.site, "张迦勒", "2026-08", today=date(2026, 8, 21))
+        self.assertIn("张迦勒｜2026年8月", text)
+        self.assertIn("灵修：1/21 天｜完整：1/21 天", text)
+        self.assertIn("17日  🟨 2/4", text)
+        self.assertIn("20日  ✅ 3/4", text)
+        self.assertIn("21日  🟨 2/4", text)
+
+    def test_member_month_status_rejects_future_month(self):
+        with self.assertRaises(ValueError):
+            bot.member_month_status(self.site, "张迦勒", "2026-09", today=date(2026, 8, 21))
 
     def test_private_welcome_is_sent_only_once(self):
         fake_bot = SimpleNamespace()

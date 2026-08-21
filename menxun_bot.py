@@ -9,6 +9,7 @@ import re
 import ssl
 import threading
 import time
+from calendar import monthrange
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -556,6 +557,7 @@ def help_text(site: SiteConfig | None = None) -> str:
         "",
         "查看进度",
         "我的状态 — 查看个人完成情况",
+        "我的月状态 — 查看个人本月月历",
         "群状态 — 查看全群完成情况",
         "任务 — 查看今日和本周任务",
         "",
@@ -836,6 +838,65 @@ def website_status(site: SiteConfig, name: str = "") -> str:
     }
     total = len(website_state.get("members") or [])
     return f"📊 {site.name} · 群状态\n日期：{today_text}｜成员：{total} 人\n灵修/读经：{counts['daily']} 人\n周读物：{counts['book']} 人\n视频：{counts['video']} 人\n背经：{counts['verse']} 人"
+
+
+def member_month_status(
+    site: SiteConfig,
+    name: str,
+    month_text: str = "",
+    today: date | None = None,
+) -> str:
+    """按照网站人物月历规则输出成员的文字月历。"""
+    current_date = today or now(site).date()
+    clean_month = month_text.strip()
+    if clean_month:
+        match = re.fullmatch(r"(20\d{2})[-年](\d{1,2})月?", clean_month)
+        if not match:
+            raise ValueError("月份格式无效")
+        year, month = int(match.group(1)), int(match.group(2))
+        if month < 1 or month > 12:
+            raise ValueError("月份格式无效")
+    else:
+        year, month = current_date.year, current_date.month
+    month_start = date(year, month, 1)
+    current_month_start = current_date.replace(day=1)
+    if month_start > current_month_start:
+        raise ValueError("不能查看未来月份")
+
+    website_state, config = website_snapshot(site)
+    weekly_schedule = website_state.get("weeklySchedule") or config.get("weekly_schedule") or []
+    records = website_state.get("records") or []
+    last_day = monthrange(year, month)[1]
+    if year == current_date.year and month == current_date.month:
+        last_day = current_date.day
+
+    task_types = ("每日灵修", "周读物", "周视频", "周背经")
+    rows = []
+    devotion_days = 0
+    complete_days = 0
+    for day_number in range(1, last_day + 1):
+        target_date = date(year, month, day_number)
+        done = [
+            any(website_record_matches(record, name, task_type, target_date, weekly_schedule, site) for record in records)
+            for task_type in task_types
+        ]
+        total_count = sum(done)
+        daily_done = done[0]
+        complete = daily_done and sum(done[1:]) >= 2
+        devotion_days += int(daily_done)
+        complete_days += int(complete)
+        marker = "✅" if complete else "🟦" if daily_done else "🟨" if total_count else "⬜"
+        rows.append(f"{day_number:02d}日  {marker} {total_count}/4")
+
+    return "\n".join([
+        f"📅 {site.name} · 人物月历",
+        f"{name}｜{year}年{month}月",
+        f"灵修：{devotion_days}/{last_day} 天｜完整：{complete_days}/{last_day} 天",
+        "",
+        *rows,
+        "",
+        "✅ 完整　🟦 已灵修　🟨 仅周任务　⬜ 未完成",
+    ])
 
 
 def record_datetime(record: dict, site: SiteConfig) -> datetime | None:
@@ -1169,7 +1230,7 @@ def on_new_message(bot, accid: int, event) -> None:
             send(bot, accid, chat_id, f"🌐 {site.name}\n" + task_summary(config, site=site))
             return
         if text in {"状态", "进度"}:
-            send(bot, accid, chat_id, "请选择：\n· 我的状态\n· 群状态")
+            send(bot, accid, chat_id, "请选择：\n· 我的状态\n· 我的月状态\n· 群状态")
             return
         if text in {"群状态", "小组状态", "群进度"}:
             send(bot, accid, chat_id, website_status(site))
@@ -1177,6 +1238,17 @@ def on_new_message(bot, accid: int, event) -> None:
         if text in {"我的状态", "个人状态"}:
             name = bound_name(member_id, site)
             send(bot, accid, chat_id, website_status(site, name) if name else f"请先绑定 {site.name} 的身份，例如：绑定 {site.site_id} 你的姓名")
+            return
+        if text.startswith("我的月状态") or text.startswith("个人月状态") or text.startswith("我的月历"):
+            name = bound_name(member_id, site)
+            if not name:
+                send(bot, accid, chat_id, f"请先绑定 {site.name} 的身份，例如：绑定 你的姓名")
+                return
+            month_value = re.sub(r"^(?:我的月状态|个人月状态|我的月历)\s*", "", command_text).strip()
+            try:
+                send(bot, accid, chat_id, member_month_status(site, name, month_value))
+            except ValueError:
+                send(bot, accid, chat_id, "月份格式不正确。\n请发送“我的月状态”，或例如“我的月状态 2026-07”。")
             return
         if text.startswith("补签") or text.startswith("补打卡"):
             name = bound_name(member_id, site)
