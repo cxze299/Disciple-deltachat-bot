@@ -141,6 +141,35 @@ class MenxunBotTests(unittest.TestCase):
         broadcast.assert_called_once_with(fake_bot, 1, self.site, "群通知")
         send.assert_called_once_with(fake_bot, 1, 900, "打卡成功\n已通知 2 个群。")
 
+    def test_website_poll_baselines_then_notifies_new_checkin_and_retro(self):
+        initial = {"records": [{"Id": 1, "name": "甲", "logical_date": "2026-08-21", "daily": "done"}]}
+        updated = {"records": [
+            *initial["records"],
+            {"Id": 2, "name": "乙", "logical_date": "2026-08-22", "daily": "done"},
+            {"Id": 3, "name": "丙", "logical_date": "2026-08-20", "book": "done", "is_retro": "yes"},
+        ]}
+        temporary_state = {
+            "website_records": {}, "recent_announcements": {}, "bindings": {}, "active_sites": {},
+            "checkins": {}, "reminded": {}, "admins": {}, "welcomed": {},
+        }
+        fake_bot = SimpleNamespace()
+        with patch.object(bot, "state", temporary_state), patch.object(bot, "save_state"), patch.object(bot, "website_snapshot", side_effect=[(initial, {}), (updated, {})]), patch.object(bot, "build_group_update", side_effect=lambda site, name, kind, day, **kwargs: f"{name}|{kind}|{day}|retro={kwargs.get('retro')}"), patch.object(bot, "broadcast_group_update") as broadcast:
+            self.assertEqual(bot.poll_website_notifications(fake_bot, 1, self.site), 0)
+            self.assertEqual(bot.poll_website_notifications(fake_bot, 1, self.site), 2)
+        messages = [call.args[3] for call in broadcast.call_args_list]
+        self.assertIn("乙|每日灵修|2026-08-22|retro=False", messages)
+        self.assertIn("丙|周读物|2026-08-20|retro=True", messages)
+
+    def test_website_poll_does_not_notify_deleted_records(self):
+        temporary_state = {
+            "website_records": {self.site.site_id: ["id:1", "id:2"]}, "recent_announcements": {},
+            "bindings": {}, "active_sites": {}, "checkins": {}, "reminded": {}, "admins": {}, "welcomed": {},
+        }
+        remaining = {"records": [{"Id": 1, "name": "甲", "logical_date": "2026-08-21", "daily": "done"}]}
+        with patch.object(bot, "state", temporary_state), patch.object(bot, "save_state"), patch.object(bot, "website_snapshot", return_value=(remaining, {})), patch.object(bot, "broadcast_group_update") as broadcast:
+            self.assertEqual(bot.poll_website_notifications(SimpleNamespace(), 1, self.site), 0)
+        broadcast.assert_not_called()
+
     def test_help_keeps_status_commands_explicit(self):
         other_site = bot.SiteConfig(site_id="other", name="其他网站", url="https://other.test", chat_ids=frozenset())
         with patch.object(bot, "SITES", (self.site, other_site)), patch.object(bot, "DEFAULT_SITE", self.site):

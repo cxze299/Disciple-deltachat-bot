@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -184,10 +185,16 @@ def load_state() -> dict:
     loaded.setdefault("active_sites", {})
     loaded.setdefault("admins", {})
     loaded.setdefault("welcomed", {})
+    loaded.setdefault("website_records", {})
+    loaded.setdefault("recent_announcements", {})
     if not isinstance(loaded["admins"], dict):
         loaded["admins"] = {}
     if not isinstance(loaded["welcomed"], dict):
         loaded["welcomed"] = {}
+    if not isinstance(loaded["website_records"], dict):
+        loaded["website_records"] = {}
+    if not isinstance(loaded["recent_announcements"], dict):
+        loaded["recent_announcements"] = {}
     return loaded
 
 
@@ -1120,6 +1127,86 @@ def build_group_update(
     return headline + f"\n\n{title}\n" + ("\n".join(rows) if rows else "暂无打卡")
 
 
+def record_fingerprint(record: dict) -> str:
+    record_id = record.get("Id", record.get("id", record.get("ID")))
+    if record_id not in (None, ""):
+        return f"id:{record_id}"
+    payload = json.dumps(record, ensure_ascii=False, sort_keys=True, default=str)
+    return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def record_completed_types(record: dict) -> list[str]:
+    columns = (
+        ("每日灵修", "daily"),
+        ("周读物", "book"),
+        ("周视频", "video"),
+        ("周背经", "verse"),
+    )
+    return [
+        checkin_type
+        for checkin_type, column in columns
+        if is_done_value(record.get(column)) or is_done_value(record.get(checkin_type))
+    ]
+
+
+def announcement_key(site: SiteConfig, name: str, checkin_type: str, logical_date: str) -> str:
+    return f"{site.site_id}:{logical_date}:{name}:{checkin_type}"
+
+
+def remember_announced_change(site: SiteConfig, name: str, checkin_type: str, logical_date: str) -> None:
+    with state_lock:
+        state["recent_announcements"][announcement_key(site, name, checkin_type, logical_date)] = time.time()
+        save_state()
+
+
+def poll_website_notifications(bot, accid: int, site: SiteConfig) -> int:
+    """检测网站新增打卡；首次运行仅建立基线，删除记录不会产生通知。"""
+    website_state, _ = website_snapshot(site)
+    records = [record for record in (website_state.get("records") or []) if isinstance(record, dict)]
+    current = {record_fingerprint(record): record for record in records}
+    with state_lock:
+        has_baseline = site.site_id in state["website_records"]
+        previous = set(state["website_records"].get(site.site_id, []))
+        if not has_baseline:
+            state["website_records"][site.site_id] = sorted(current)
+            save_state()
+            return 0
+
+    fallback_time = datetime.min.replace(tzinfo=ZoneInfo(site.timezone))
+    new_records = [current[key] for key in current.keys() - previous]
+    new_records.sort(key=lambda record: (record_datetime(record, site) or fallback_time, record_fingerprint(record)))
+    delivered_events = 0
+    for record in new_records:
+        name = record_name(record)
+        logical_date = record_logical_date(record, site)
+        if not name or not logical_date:
+            continue
+        for checkin_type in record_completed_types(record):
+            key = announcement_key(site, name, checkin_type, logical_date)
+            announced_at = float(state["recent_announcements"].get(key, 0) or 0)
+            if time.time() - announced_at < 180:
+                continue
+            message = build_group_update(
+                site,
+                name,
+                checkin_type,
+                logical_date,
+                retro=record_is_retro(record),
+            )
+            broadcast_group_update(bot, accid, site, message)
+            delivered_events += 1
+
+    with state_lock:
+        state["website_records"][site.site_id] = sorted(current)
+        cutoff = time.time() - 600
+        state["recent_announcements"] = {
+            key: value for key, value in state["recent_announcements"].items()
+            if float(value or 0) >= cutoff
+        }
+        save_state()
+    return delivered_events
+
+
 def broadcast_group_update(bot, accid: int, site: SiteConfig, message: str) -> int:
     delivered = 0
     for group_chat_id in sorted(site.chat_ids):
@@ -1432,6 +1519,7 @@ def on_new_message(bot, accid: int, event) -> None:
                 bot.logger.exception("网站 %s 补签同步失败：%s", site.site_id, error)
                 ok, result = False, "网站暂时不可用，本次补签没有写入，请稍后重试。"
             if ok:
+                remember_announced_change(site, name, checkin_type, logical_date)
                 message = build_group_update(site, name, checkin_type, logical_date, retro=True)
                 announce_change(
                     bot,
@@ -1498,6 +1586,7 @@ def on_new_message(bot, accid: int, event) -> None:
                 ok, result = False, "网站暂时不可用，本次打卡没有写入，请稍后重试。"
             if ok:
                 logical_date = now(site).date().isoformat()
+                remember_announced_change(site, name, checkin_type, logical_date)
                 message = build_group_update(site, name, checkin_type, logical_date)
                 announce_change(
                     bot,
@@ -1528,6 +1617,10 @@ def reminder_loop(bot, accid: int) -> None:
         for site in SITES:
             if not site.chat_ids:
                 continue
+            try:
+                poll_website_notifications(bot, accid, site)
+            except Exception as error:
+                bot.logger.exception("监听网站打卡失败：site=%s error=%s", site.site_id, error)
             current = now(site)
             if reminder_due(current, site.morning_time):
                 reminder_kind = "morning"
