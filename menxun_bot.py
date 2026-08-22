@@ -35,6 +35,10 @@ WEBSITE_URL = os.getenv("MENXUN_WEBSITE_URL", "http://127.0.0.1:3000").rstrip("/
 MORNING_REMINDER_TIME = os.getenv("MORNING_REMINDER_TIME", "08:30")
 EVENING_REMINDER_TIME = os.getenv("EVENING_REMINDER_TIME", os.getenv("REMINDER_TIME", "20:30"))
 CHAT_IDS = {int(x) for x in os.getenv("CHAT_IDS", "").split(",") if x.strip().isdigit()}
+try:
+    WEBSITE_POLL_INTERVAL = min(60.0, max(2.0, float(os.getenv("WEBSITE_POLL_INTERVAL", "5"))))
+except ValueError:
+    WEBSITE_POLL_INTERVAL = 5.0
 SITES_FILE = Path(os.getenv("MENXUN_SITES_FILE", ROOT / "sites.json"))
 ADMIN_KEY_FILE = Path(os.getenv("MENXUN_ADMIN_KEY_FILE", DATA_DIR / "admin-key.json"))
 
@@ -1735,7 +1739,7 @@ def reminder_loop(bot, accid: int) -> None:
                         save_state()
                 except Exception as error:
                     bot.logger.exception("发送提醒失败：site=%s chat_id=%s error=%s", site.site_id, chat_id, error)
-        time.sleep(20)
+        time.sleep(WEBSITE_POLL_INTERVAL)
 
 
 @cli.on_start
@@ -1758,7 +1762,11 @@ def on_start(bot, args) -> None:
             site.evening_time,
             site.timezone,
         )
-    bot.logger.info("门训同行多网站服务已启动，共 %s 个网站", len(SITES))
+    bot.logger.info(
+        "门训同行多网站服务已启动，共 %s 个网站，网站监听间隔 %.1f 秒",
+        len(SITES),
+        WEBSITE_POLL_INTERVAL,
+    )
 
 
 if __name__ == "__main__":

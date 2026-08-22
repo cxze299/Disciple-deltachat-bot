@@ -44,6 +44,10 @@ class MenxunBotTests(unittest.TestCase):
             "verse": "约翰福音 3:16",
         }]
 
+    def test_website_poll_interval_is_fast_but_safely_bounded(self):
+        self.assertGreaterEqual(bot.WEBSITE_POLL_INTERVAL, 2)
+        self.assertLessEqual(bot.WEBSITE_POLL_INTERVAL, 60)
+
     def test_daily_uses_exact_logical_date(self):
         record = {"name": "张迦勒", "logical_date": "2026-08-20", "daily": "done"}
         self.assertTrue(bot.website_record_matches(record, "张迦勒", "每日灵修", date(2026, 8, 20), self.schedule, self.site))
