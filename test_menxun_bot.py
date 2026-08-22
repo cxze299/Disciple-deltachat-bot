@@ -214,6 +214,14 @@ class MenxunBotTests(unittest.TestCase):
         self.assertIn("旷野的筵席", text)
         self.assertIn("这是当天内容", text)
 
+    def test_daily_devotion_highlights_quoted_scripture(self):
+        lines = ["「你们要常在我里面，我也常在你们里面。」", "解释内容。", "**「已经加粗的经文」**", "“另一处经文”"]
+        text = bot.clean_devotion_markdown(lines)
+        self.assertIn("**「你们要常在我里面，我也常在你们里面。」**", text)
+        self.assertIn("**「已经加粗的经文」**", text)
+        self.assertNotIn("****「已经加粗的经文」****", text)
+        self.assertIn("**“另一处经文”**", text)
+
     def test_private_welcome_is_sent_only_once(self):
         fake_bot = SimpleNamespace()
         temporary_state = {"welcomed": {}, "bindings": {}, "active_sites": {}, "checkins": {}, "reminded": {}, "admins": {}}
