@@ -222,6 +222,16 @@ class MenxunBotTests(unittest.TestCase):
         self.assertNotIn("****「已经加粗的经文」****", text)
         self.assertIn("**“另一处经文”**", text)
 
+    def test_send_uses_html_for_bold_and_plain_text_fallback(self):
+        sent = []
+        fake_bot = SimpleNamespace(rpc=SimpleNamespace(send_msg=lambda *args: sent.append(args)))
+        bot.send(fake_bot, 1, 9, "标题\n**「经文」**\n解释")
+        self.assertEqual(len(sent), 1)
+        message = sent[0][2]
+        self.assertEqual(message.text, "标题\n「经文」\n解释")
+        self.assertIn("<strong>「经文」</strong>", message.html)
+        self.assertIn("<br>", message.html)
+
     def test_private_welcome_is_sent_only_once(self):
         fake_bot = SimpleNamespace()
         temporary_state = {"welcomed": {}, "bindings": {}, "active_sites": {}, "checkins": {}, "reminded": {}, "admins": {}}

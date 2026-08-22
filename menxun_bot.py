@@ -9,6 +9,7 @@ import re
 import ssl
 import threading
 import time
+import html as html_lib
 from calendar import monthrange
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -255,7 +256,14 @@ def safe_log_text(raw_text: str) -> str:
 
 
 def send(bot, accid: int, chat_id: int, text: str) -> None:
-    bot.rpc.send_msg(accid, chat_id, MessageData(text=text))
+    if "**" not in text:
+        bot.rpc.send_msg(accid, chat_id, MessageData(text=text))
+        return
+    plain_text = text.replace("**", "")
+    escaped = html_lib.escape(text)
+    formatted = re.sub(r"\*\*([\s\S]*?)\*\*", r"<strong>\1</strong>", escaped)
+    html = "<div>" + formatted.replace("\n", "<br>") + "</div>"
+    bot.rpc.send_msg(accid, chat_id, MessageData(text=plain_text, html=html))
 
 
 def welcome_text() -> str:
