@@ -1076,7 +1076,12 @@ def record_datetime(record: dict, site: SiteConfig) -> datetime | None:
         return None
 
 
-def checkin_timeline(site: SiteConfig, checkin_type: str, logical_date: str) -> tuple[str, list[str]]:
+def checkin_timeline(
+    site: SiteConfig,
+    checkin_type: str,
+    logical_date: str,
+    excluded_names: frozenset[str] = frozenset(),
+) -> tuple[str, list[str]]:
     """按网站现有状态生成某项任务的完成名单，每人只保留最早完成时间。"""
     website_state, config = website_snapshot(site)
     target_date = date.fromisoformat(logical_date)
@@ -1084,7 +1089,7 @@ def checkin_timeline(site: SiteConfig, checkin_type: str, logical_date: str) -> 
     first_by_name: dict[str, tuple[float, datetime | None]] = {}
     for record in website_state.get("records") or []:
         name = record_name(record)
-        if not name or not website_record_matches(record, name, checkin_type, target_date, weekly_schedule, site):
+        if name in excluded_names or not name or not website_record_matches(record, name, checkin_type, target_date, weekly_schedule, site):
             continue
         value = record_datetime(record, site)
         sort_value = value.timestamp() if value else float("inf")
@@ -1125,7 +1130,12 @@ def build_group_update(
     if operation_time:
         headline += f"\n操作时间：{operation_time}"
     try:
-        title, rows = checkin_timeline(site, checkin_type, logical_date)
+        title, rows = checkin_timeline(
+            site,
+            checkin_type,
+            logical_date,
+            frozenset({name}) if cancelled else frozenset(),
+        )
     except Exception:
         return headline + "\n名单暂时无法读取，请发送“群状态”重试。"
     if not rows and not cancelled:
@@ -1203,31 +1213,7 @@ def poll_website_notifications(bot, accid: int, site: SiteConfig) -> int:
             save_state()
             return 0
 
-    fallback_time = datetime.min.replace(tzinfo=ZoneInfo(site.timezone))
-    new_records = [current[key] for key in current.keys() - previous]
-    new_records.sort(key=lambda record: (record_datetime(record, site) or fallback_time, record_fingerprint(record)))
     delivered_events = 0
-    for record in new_records:
-        name = record_name(record)
-        logical_date = record_logical_date(record, site)
-        if not name or not logical_date:
-            continue
-        for checkin_type in record_completed_types(record):
-            key = announcement_key(site, name, checkin_type, logical_date)
-            announced_at = float(state["recent_announcements"].get(key, 0) or 0)
-            if time.time() - announced_at < 180:
-                continue
-            message = build_group_update(
-                site,
-                name,
-                checkin_type,
-                logical_date,
-                retro=record_is_retro(record),
-                event_time=(record_datetime(record, site) or now(site)).strftime("%m-%d %H:%M"),
-            )
-            broadcast_group_update(bot, accid, site, message)
-            delivered_events += 1
-
     operation_time = now(site).strftime("%Y-%m-%d %H:%M:%S")
     for fingerprint in sorted(previous - set(current)):
         summary = previous_records.get(fingerprint)
@@ -1250,6 +1236,30 @@ def poll_website_notifications(bot, accid: int, site: SiteConfig) -> int:
                 cancelled=True,
                 retro=bool(summary.get("retro")),
                 operation_time=operation_time,
+            )
+            broadcast_group_update(bot, accid, site, message)
+            delivered_events += 1
+
+    fallback_time = datetime.min.replace(tzinfo=ZoneInfo(site.timezone))
+    new_records = [current[key] for key in current.keys() - previous]
+    new_records.sort(key=lambda record: (record_datetime(record, site) or fallback_time, record_fingerprint(record)))
+    for record in new_records:
+        name = record_name(record)
+        logical_date = record_logical_date(record, site)
+        if not name or not logical_date:
+            continue
+        for checkin_type in record_completed_types(record):
+            key = announcement_key(site, name, checkin_type, logical_date)
+            announced_at = float(state["recent_announcements"].get(key, 0) or 0)
+            if time.time() - announced_at < 180:
+                continue
+            message = build_group_update(
+                site,
+                name,
+                checkin_type,
+                logical_date,
+                retro=record_is_retro(record),
+                event_time=(record_datetime(record, site) or now(site)).strftime("%m-%d %H:%M"),
             )
             broadcast_group_update(bot, accid, site, message)
             delivered_events += 1

@@ -198,6 +198,28 @@ class MenxunBotTests(unittest.TestCase):
         self.assertIn("乙取消了打卡：灵修", text)
         self.assertIn("操作时间：2026-08-22 19:45:12", text)
 
+    def test_cancel_timeline_excludes_cancelled_member(self):
+        records = [
+            {"name": "甲", "logical_date": "2026-08-22", "daily": "done", "checkin_time": "2026-08-22T08:00:00+08:00"},
+            {"name": "信择", "logical_date": "2026-08-22", "daily": "done", "checkin_time": "2026-08-22T19:43:00+08:00"},
+        ]
+        with patch.object(bot, "website_snapshot", return_value=({"records": records}, {})):
+            _, rows = bot.checkin_timeline(self.site, "每日灵修", "2026-08-22", frozenset({"信择"}))
+        self.assertEqual(rows, ["1. 08:00  甲"])
+
+    def test_same_poll_sends_cancellation_before_recheck(self):
+        temporary_state = {
+            "website_records": {self.site.site_id: {"id:1": {"name": "信择", "logical_date": "2026-08-22", "types": ["每日灵修"], "retro": False}}},
+            "recent_announcements": {}, "bindings": {}, "active_sites": {}, "checkins": {},
+            "reminded": {}, "admins": {}, "welcomed": {},
+        }
+        current = {"records": [{"Id": 2, "name": "信择", "logical_date": "2026-08-22", "daily": "done", "checkin_time": "2026-08-22T19:44:00+08:00"}]}
+        def build_message(site, name, kind, day, **kwargs):
+            return "取消" if kwargs.get("cancelled") else "打卡"
+        with patch.object(bot, "state", temporary_state), patch.object(bot, "save_state"), patch.object(bot, "website_snapshot", return_value=(current, {})), patch.object(bot, "build_group_update", side_effect=build_message), patch.object(bot, "broadcast_group_update") as broadcast:
+            self.assertEqual(bot.poll_website_notifications(SimpleNamespace(), 1, self.site), 2)
+        self.assertEqual([call.args[3] for call in broadcast.call_args_list], ["取消", "打卡"])
+
     def test_checkin_notification_never_says_checked_in_then_empty(self):
         with patch.object(bot, "checkin_timeline", return_value=("本周背经（按时间）", [])):
             text = bot.build_group_update(
