@@ -1112,6 +1112,8 @@ def build_group_update(
     logical_date: str,
     cancelled: bool = False,
     retro: bool = False,
+    operation_time: str = "",
+    event_time: str = "",
 ) -> str:
     display_type = {"每日灵修": "灵修", "周读物": "周读物", "周视频": "视频", "周背经": "背经"}[checkin_type]
     if cancelled:
@@ -1120,10 +1122,15 @@ def build_group_update(
         headline = f"✅ {name}打卡了：{display_type}"
     if retro:
         headline += f"（补签 {logical_date}）"
+    if operation_time:
+        headline += f"\n操作时间：{operation_time}"
     try:
         title, rows = checkin_timeline(site, checkin_type, logical_date)
     except Exception:
         return headline + "\n名单暂时无法读取，请发送“群状态”重试。"
+    if not rows and not cancelled:
+        fallback_time = event_time or now(site).strftime("%m-%d %H:%M")
+        return headline + f"\n\n本次记录\n1. {fallback_time}  {name}"
     return headline + f"\n\n{title}\n" + ("\n".join(rows) if rows else "暂无打卡")
 
 
@@ -1149,26 +1156,50 @@ def record_completed_types(record: dict) -> list[str]:
     ]
 
 
-def announcement_key(site: SiteConfig, name: str, checkin_type: str, logical_date: str) -> str:
-    return f"{site.site_id}:{logical_date}:{name}:{checkin_type}"
+def compact_record(record: dict, site: SiteConfig) -> dict:
+    return {
+        "name": record_name(record),
+        "logical_date": record_logical_date(record, site),
+        "types": record_completed_types(record),
+        "retro": record_is_retro(record),
+    }
 
 
-def remember_announced_change(site: SiteConfig, name: str, checkin_type: str, logical_date: str) -> None:
+def announcement_key(
+    site: SiteConfig,
+    name: str,
+    checkin_type: str,
+    logical_date: str,
+    action: str = "checkin",
+) -> str:
+    return f"{action}:{site.site_id}:{logical_date}:{name}:{checkin_type}"
+
+
+def remember_announced_change(
+    site: SiteConfig,
+    name: str,
+    checkin_type: str,
+    logical_date: str,
+    action: str = "checkin",
+) -> None:
     with state_lock:
-        state["recent_announcements"][announcement_key(site, name, checkin_type, logical_date)] = time.time()
+        state["recent_announcements"][announcement_key(site, name, checkin_type, logical_date, action)] = time.time()
         save_state()
 
 
 def poll_website_notifications(bot, accid: int, site: SiteConfig) -> int:
-    """检测网站新增打卡；首次运行仅建立基线，删除记录不会产生通知。"""
+    """检测网站新增和删除记录；首次运行仅建立基线。"""
     website_state, _ = website_snapshot(site)
     records = [record for record in (website_state.get("records") or []) if isinstance(record, dict)]
     current = {record_fingerprint(record): record for record in records}
+    current_compact = {key: compact_record(record, site) for key, record in current.items()}
     with state_lock:
         has_baseline = site.site_id in state["website_records"]
-        previous = set(state["website_records"].get(site.site_id, []))
+        previous_payload = state["website_records"].get(site.site_id, {})
+        previous_records = previous_payload if isinstance(previous_payload, dict) else {}
+        previous = set(previous_records if previous_records else previous_payload)
         if not has_baseline:
-            state["website_records"][site.site_id] = sorted(current)
+            state["website_records"][site.site_id] = current_compact
             save_state()
             return 0
 
@@ -1192,12 +1223,39 @@ def poll_website_notifications(bot, accid: int, site: SiteConfig) -> int:
                 checkin_type,
                 logical_date,
                 retro=record_is_retro(record),
+                event_time=(record_datetime(record, site) or now(site)).strftime("%m-%d %H:%M"),
+            )
+            broadcast_group_update(bot, accid, site, message)
+            delivered_events += 1
+
+    operation_time = now(site).strftime("%Y-%m-%d %H:%M:%S")
+    for fingerprint in sorted(previous - set(current)):
+        summary = previous_records.get(fingerprint)
+        if not isinstance(summary, dict):
+            continue
+        name = str(summary.get("name") or "").strip()
+        logical_date = str(summary.get("logical_date") or "").strip()
+        if not name or not logical_date:
+            continue
+        for checkin_type in summary.get("types") or []:
+            key = announcement_key(site, name, checkin_type, logical_date, "cancel")
+            announced_at = float(state["recent_announcements"].get(key, 0) or 0)
+            if time.time() - announced_at < 180:
+                continue
+            message = build_group_update(
+                site,
+                name,
+                checkin_type,
+                logical_date,
+                cancelled=True,
+                retro=bool(summary.get("retro")),
+                operation_time=operation_time,
             )
             broadcast_group_update(bot, accid, site, message)
             delivered_events += 1
 
     with state_lock:
-        state["website_records"][site.site_id] = sorted(current)
+        state["website_records"][site.site_id] = current_compact
         cutoff = time.time() - 600
         state["recent_announcements"] = {
             key: value for key, value in state["recent_announcements"].items()
@@ -1520,7 +1578,14 @@ def on_new_message(bot, accid: int, event) -> None:
                 ok, result = False, "网站暂时不可用，本次补签没有写入，请稍后重试。"
             if ok:
                 remember_announced_change(site, name, checkin_type, logical_date)
-                message = build_group_update(site, name, checkin_type, logical_date, retro=True)
+                message = build_group_update(
+                    site,
+                    name,
+                    checkin_type,
+                    logical_date,
+                    retro=True,
+                    event_time=now(site).strftime("%m-%d %H:%M"),
+                )
                 announce_change(
                     bot,
                     accid,
@@ -1556,7 +1621,17 @@ def on_new_message(bot, accid: int, event) -> None:
                 bot.logger.exception("网站 %s 取消打卡失败：%s", site.site_id, error)
                 ok, result = False, "网站暂时无法连接，取消失败，请稍后再试。"
             if ok:
-                message = build_group_update(site, name, checkin_type, logical_date, cancelled=True, retro=retro_only)
+                operation_time = now(site).strftime("%Y-%m-%d %H:%M:%S")
+                remember_announced_change(site, name, checkin_type, logical_date, action="cancel")
+                message = build_group_update(
+                    site,
+                    name,
+                    checkin_type,
+                    logical_date,
+                    cancelled=True,
+                    retro=retro_only,
+                    operation_time=operation_time,
+                )
                 announce_change(
                     bot,
                     accid,
@@ -1587,7 +1662,13 @@ def on_new_message(bot, accid: int, event) -> None:
             if ok:
                 logical_date = now(site).date().isoformat()
                 remember_announced_change(site, name, checkin_type, logical_date)
-                message = build_group_update(site, name, checkin_type, logical_date)
+                message = build_group_update(
+                    site,
+                    name,
+                    checkin_type,
+                    logical_date,
+                    event_time=now(site).strftime("%m-%d %H:%M"),
+                )
                 announce_change(
                     bot,
                     accid,

@@ -2,7 +2,7 @@ import json
 import os
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, datetime
 from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.error import URLError
@@ -160,7 +160,7 @@ class MenxunBotTests(unittest.TestCase):
         self.assertIn("乙|每日灵修|2026-08-22|retro=False", messages)
         self.assertIn("丙|周读物|2026-08-20|retro=True", messages)
 
-    def test_website_poll_does_not_notify_deleted_records(self):
+    def test_website_poll_migrates_legacy_baseline_without_false_cancellation(self):
         temporary_state = {
             "website_records": {self.site.site_id: ["id:1", "id:2"]}, "recent_announcements": {},
             "bindings": {}, "active_sites": {}, "checkins": {}, "reminded": {}, "admins": {}, "welcomed": {},
@@ -169,6 +169,47 @@ class MenxunBotTests(unittest.TestCase):
         with patch.object(bot, "state", temporary_state), patch.object(bot, "save_state"), patch.object(bot, "website_snapshot", return_value=(remaining, {})), patch.object(bot, "broadcast_group_update") as broadcast:
             self.assertEqual(bot.poll_website_notifications(SimpleNamespace(), 1, self.site), 0)
         broadcast.assert_not_called()
+
+    def test_website_poll_notifies_cancellation_with_operation_time(self):
+        previous_summary = {
+            "name": "乙", "logical_date": "2026-08-20", "types": ["每日灵修", "周视频"], "retro": True,
+        }
+        temporary_state = {
+            "website_records": {self.site.site_id: {"id:2": previous_summary}}, "recent_announcements": {},
+            "bindings": {}, "active_sites": {}, "checkins": {}, "reminded": {}, "admins": {}, "welcomed": {},
+        }
+        fixed_now = datetime(2026, 8, 22, 19, 45, 12, tzinfo=bot.ZoneInfo("Asia/Shanghai"))
+        with patch.object(bot, "state", temporary_state), patch.object(bot, "save_state"), patch.object(bot, "website_snapshot", return_value=({"records": []}, {})), patch.object(bot, "now", return_value=fixed_now), patch.object(bot, "build_group_update", side_effect=lambda site, name, kind, day, **kwargs: f"{name}|{kind}|cancelled={kwargs.get('cancelled')}|time={kwargs.get('operation_time')}"), patch.object(bot, "broadcast_group_update") as broadcast:
+            self.assertEqual(bot.poll_website_notifications(SimpleNamespace(), 1, self.site), 2)
+        messages = [call.args[3] for call in broadcast.call_args_list]
+        self.assertIn("乙|每日灵修|cancelled=True|time=2026-08-22 19:45:12", messages)
+        self.assertIn("乙|周视频|cancelled=True|time=2026-08-22 19:45:12", messages)
+
+    def test_cancel_group_update_includes_operation_time(self):
+        with patch.object(bot, "checkin_timeline", return_value=("当天灵修（按时间）", [])):
+            text = bot.build_group_update(
+                self.site,
+                "乙",
+                "每日灵修",
+                "2026-08-20",
+                cancelled=True,
+                operation_time="2026-08-22 19:45:12",
+            )
+        self.assertIn("乙取消了打卡：灵修", text)
+        self.assertIn("操作时间：2026-08-22 19:45:12", text)
+
+    def test_checkin_notification_never_says_checked_in_then_empty(self):
+        with patch.object(bot, "checkin_timeline", return_value=("本周背经（按时间）", [])):
+            text = bot.build_group_update(
+                self.site,
+                "信择",
+                "周背经",
+                "2026-08-22",
+                event_time="08-22 19:35",
+            )
+        self.assertIn("信择打卡了：背经", text)
+        self.assertIn("本次记录\n1. 08-22 19:35  信择", text)
+        self.assertNotIn("暂无打卡", text)
 
     def test_help_keeps_status_commands_explicit(self):
         other_site = bot.SiteConfig(site_id="other", name="其他网站", url="https://other.test", chat_ids=frozenset())
