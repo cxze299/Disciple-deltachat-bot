@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.error import HTTPError, URLError
+from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -149,6 +150,7 @@ state_lock = threading.Lock()
 reminder_started = False
 config_cache_lock = threading.Lock()
 config_cache: dict[str, tuple[float, dict]] = {}
+devotion_cache: dict[str, tuple[float, str]] = {}
 admin_attempt_lock = threading.Lock()
 admin_failed_attempts: dict[int, list[float]] = {}
 
@@ -308,6 +310,35 @@ def fetch_json(site: SiteConfig, path: str) -> dict:
                 break
             time.sleep(0.5 * (2 ** attempt))
     raise RuntimeError(f"读取门训网站失败（已重试 4 次）：{url}；{last_error}") from last_error
+
+
+def fetch_text(site: SiteConfig, path: str) -> str:
+    url = urljoin(f"{site.url}/", str(path or "").lstrip("./"))
+    with config_cache_lock:
+        cached = devotion_cache.get(url)
+        if cached and time.monotonic() - cached[0] < 3600:
+            return cached[1]
+    last_error: Exception | None = None
+    for attempt in range(4):
+        request = Request(url, headers={
+            "Accept": "text/markdown,text/plain,*/*",
+            "Connection": "close",
+            "User-Agent": "MenxunDeltaChatBot/1.0",
+        })
+        try:
+            with urlopen(request, timeout=15) as response:
+                text = response.read().decode("utf-8-sig", errors="replace")
+            with config_cache_lock:
+                devotion_cache[url] = (time.monotonic(), text)
+            return text
+        except HTTPError:
+            raise
+        except (URLError, TimeoutError, ssl.SSLError, ConnectionError) as error:
+            last_error = error
+            if attempt == 3:
+                break
+            time.sleep(0.5 * (2 ** attempt))
+    raise RuntimeError(f"读取灵修内容失败（已重试 4 次）：{url}；{last_error}") from last_error
 
 
 def post_json(site: SiteConfig, path: str, payload: dict) -> dict:
@@ -502,6 +533,107 @@ def current_scripture(config: dict, today: date) -> str:
     return ""
 
 
+def chinese_calendar_number(value: int) -> str:
+    digits = "零一二三四五六七八九"
+    if value < 10:
+        return digits[value]
+    if value == 10:
+        return "十"
+    if value < 20:
+        return "十" + digits[value % 10]
+    tens, ones = divmod(value, 10)
+    return digits[tens] + "十" + (digits[ones] if ones else "")
+
+
+def clean_devotion_markdown(lines: list[str]) -> str:
+    text = "\n".join(lines)
+    text = re.sub(r"</?div[^>]*>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"!\[[^]]*]\([^)]*\)", "", text)
+    text = re.sub(r"\[([^]]+)]\([^)]*\)", r"\1", text)
+    text = re.sub(r"^\s*#{1,6}\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"^\s*(?:-{3,}|\*{3,}|_{3,})\s*$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def extract_devotion_section(markdown: str, devotion: dict, target_date: date) -> str:
+    lines = markdown.splitlines()
+    source_path = str(devotion.get("path") or devotion.get("url") or "")
+    mode = str(devotion.get("mode") or "").strip().lower()
+    if mode == "numbered" or (not mode and source_path.lower().endswith("newtestament.md")):
+        start_raw = devotion.get("numbered_start_date") or devotion.get("start_date") or target_date.isoformat()
+        try:
+            offset = (target_date - date.fromisoformat(str(start_raw))).days
+        except ValueError:
+            offset = 0
+        section_number = max(1, int(devotion.get("numbered_start") or devotion.get("start_section") or 1) + offset)
+        start_pattern = re.compile(rf"^#{{1,6}}\s*{section_number}\s*$")
+        stop_pattern = re.compile(r"^#{1,6}\s*\d+\s*$")
+        captured: list[str] = []
+        active = False
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not active:
+                if start_pattern.match(line):
+                    active = True
+                continue
+            if stop_pattern.match(line):
+                break
+            captured.append(raw_line)
+        numbered_content = clean_devotion_markdown(captured)
+        if numbered_content:
+            return numbered_content
+        # 部分旧网站把日期型 Kuangye.md 误标成 numbered；未命中时继续按日期查找。
+
+    month = target_date.month
+    day = target_date.day
+    targets = {
+        f"{month}月{day}日",
+        f"{chinese_calendar_number(month)}月{chinese_calendar_number(day)}日",
+    }
+    date_heading = re.compile(
+        r"^(?:#{1,6}\s*)?(?:\d{1,2}|[一二三四五六七八九十]{1,3})\s*月\s*"
+        r"(?:\d{1,2}|[一二三四五六七八九十]{1,3})\s*日"
+    )
+    captured = []
+    active = False
+    for raw_line in lines:
+        line = raw_line.strip()
+        normalized = re.sub(r"^#{1,6}\s*", "", line)
+        if not active:
+            if any(normalized.startswith(target) for target in targets) and len(normalized) < 100:
+                active = True
+                suffix = normalized
+                for target in targets:
+                    if suffix.startswith(target):
+                        suffix = suffix[len(target):].lstrip(" -|:：")
+                        break
+                if suffix:
+                    captured.append(suffix)
+            continue
+        if date_heading.match(line) and not any(normalized.startswith(target) for target in targets):
+            break
+        captured.append(raw_line)
+    return clean_devotion_markdown(captured)
+
+
+def daily_devotion_text(site: SiteConfig, target_date: date | None = None) -> str:
+    target_date = target_date or now(site).date()
+    _, config = website_snapshot(site)
+    daily = ((config.get("task_sections") or {}).get("daily") or {})
+    devotion = daily.get("devotion") or daily
+    source_path = devotion.get("path") or devotion.get("url") or daily.get("path") or daily.get("url")
+    title = str(devotion.get("title") or daily.get("label") or "每日灵修").strip()
+    if not source_path:
+        return f"📖 {site.name} · {target_date.isoformat()}\n该网站暂未配置可读取的灵修内容。"
+    markdown = fetch_text(site, str(source_path))
+    content = extract_devotion_section(markdown, devotion, target_date)
+    if not content:
+        return f"📖 {site.name} · {target_date.isoformat()}\n没有找到当天的灵修内容。"
+    return f"📖 {site.name} · {target_date.isoformat()}\n{title}\n\n{content}"
+
+
 def task_summary(config: dict, today: date | None = None, site: SiteConfig | None = None) -> str:
     today = today or now(site).date()
     sections = config.get("task_sections") or {}
@@ -548,6 +680,7 @@ def help_text(site: SiteConfig | None = None) -> str:
         lines.extend(["首次使用（请私聊）", "绑定 你的姓名 — 绑定身份", ""])
     lines.extend([
         "日常打卡",
+        "灵修 — 阅读当天灵修内容",
         "打卡 灵修",
         "打卡 周读物",
         "打卡 视频",
@@ -1228,6 +1361,9 @@ def on_new_message(bot, accid: int, event) -> None:
         if text in {"任务", "今日", "今天", "本周"}:
             _, config = website_snapshot(site)
             send(bot, accid, chat_id, f"🌐 {site.name}\n" + task_summary(config, site=site))
+            return
+        if text in {"灵修", "今日灵修", "灵修内容"}:
+            send(bot, accid, chat_id, daily_devotion_text(site))
             return
         if text in {"状态", "进度"}:
             send(bot, accid, chat_id, "请选择：\n· 我的状态\n· 我的月状态\n· 群状态")

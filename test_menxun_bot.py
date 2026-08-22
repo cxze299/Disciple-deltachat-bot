@@ -132,6 +132,7 @@ class MenxunBotTests(unittest.TestCase):
         self.assertIn("直接回复你所在的网站名称", text)
         self.assertIn("绑定 你的姓名", text)
         self.assertIn("日常打卡", text)
+        self.assertIn("灵修 — 阅读当天灵修内容", text)
         self.assertIn("我的状态 — 查看个人完成情况", text)
         self.assertIn("我的月状态 — 查看个人本月月历", text)
         self.assertIn("群状态 — 查看全群完成情况", text)
@@ -176,6 +177,42 @@ class MenxunBotTests(unittest.TestCase):
     def test_member_month_status_rejects_future_month(self):
         with self.assertRaises(ValueError):
             bot.member_month_status(self.site, "张迦勒", "2026-09", today=date(2026, 8, 21))
+
+    def test_extracts_numbered_daily_devotion(self):
+        markdown = "# 前言\n\n## 43\n\n**今日经文**\n\n这是今天的内容。\n\n## 44\n\n明天内容。"
+        devotion = {
+            "path": "/newtestament.md",
+            "mode": "numbered",
+            "numbered_start_date": "2026-05-27",
+            "numbered_start": 43,
+        }
+        text = bot.extract_devotion_section(markdown, devotion, date(2026, 5, 27))
+        self.assertIn("今日经文", text)
+        self.assertIn("这是今天的内容", text)
+        self.assertNotIn("明天内容", text)
+
+    def test_extracts_date_daily_devotion(self):
+        markdown = "八月二十一日\n昨天内容\n\n八月二十二日\n**今日经文**\n今天的灵修内容。\n\n八月二十三日\n明天内容"
+        devotion = {"path": "/Kuangye.md", "mode": "date"}
+        text = bot.extract_devotion_section(markdown, devotion, date(2026, 8, 22))
+        self.assertIn("今天的灵修内容", text)
+        self.assertNotIn("昨天内容", text)
+        self.assertNotIn("明天内容", text)
+
+    def test_numbered_mode_falls_back_to_date_heading(self):
+        markdown = "八月二十二日\n今天的科大灵修。\n\n八月二十三日\n明天内容。"
+        devotion = {"path": "/Kuangye.md", "mode": "numbered", "numbered_start": 1}
+        text = bot.extract_devotion_section(markdown, devotion, date(2026, 8, 22))
+        self.assertIn("今天的科大灵修", text)
+        self.assertNotIn("明天内容", text)
+
+    def test_daily_devotion_uses_selected_website_config(self):
+        config = {"task_sections": {"daily": {"devotion": {"title": "旷野的筵席", "path": "/Kuangye.md", "mode": "date"}}}}
+        markdown = "八月二十二日\n这是当天内容。\n\n八月二十三日\n下一天内容。"
+        with patch.object(bot, "website_snapshot", return_value=({}, config)), patch.object(bot, "fetch_text", return_value=markdown):
+            text = bot.daily_devotion_text(self.site, date(2026, 8, 22))
+        self.assertIn("旷野的筵席", text)
+        self.assertIn("这是当天内容", text)
 
     def test_private_welcome_is_sent_only_once(self):
         fake_bot = SimpleNamespace()
