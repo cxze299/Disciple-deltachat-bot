@@ -971,16 +971,30 @@ def website_status(site: SiteConfig, name: str = "") -> str:
             done = any(website_record_matches(r, name, checkin_type, today, weekly_schedule, site) for r in records)
             mine.append(f"✅ {label}" if done else f"⬜ {label}")
         return f"🙋 {site.name} / {name}\n" + "\n".join(mine)
-    types = {"daily": "每日灵修", "book": "周读物", "video": "周视频", "verse": "周背经"}
-    counts = {
-        column: len({
+    types = {
+        "daily": ("灵修/读经", "每日灵修"),
+        "book": ("周读物", "周读物"),
+        "video": ("视频", "周视频"),
+        "verse": ("背经", "周背经"),
+    }
+    completed = {
+        column: {
             record_name(r) for r in records
             if record_name(r) and website_record_matches(r, record_name(r), checkin_type, today, weekly_schedule, site)
-        })
-        for column, checkin_type in types.items()
+        }
+        for column, (_, checkin_type) in types.items()
     }
-    total = len(website_state.get("members") or [])
-    return f"📊 {site.name} · 群状态\n日期：{today_text}｜成员：{total} 人\n灵修/读经：{counts['daily']} 人\n周读物：{counts['book']} 人\n视频：{counts['video']} 人\n背经：{counts['verse']} 人"
+    members = [str(item).strip() for item in (website_state.get("members") or []) if str(item).strip()]
+    member_order = {member: index for index, member in enumerate(members)}
+
+    def ordered_names(names: set[str]) -> list[str]:
+        return sorted(names, key=lambda value: (member_order.get(value, len(member_order)), value))
+
+    lines = [f"📊 {site.name} · 群状态", f"日期：{today_text}｜成员：{len(members)} 人"]
+    for column, (label, _) in types.items():
+        names = ordered_names(completed[column])
+        lines.extend([f"\n{label}（{len(names)} 人）", "、".join(names) if names else "暂无"])
+    return "\n".join(lines)
 
 
 def member_month_status(

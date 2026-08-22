@@ -69,8 +69,25 @@ class MenxunBotTests(unittest.TestCase):
         }
         with patch.object(bot, "website_snapshot", return_value=(state, {"weekly_schedule": self.schedule})), patch.object(bot, "post_json") as post:
             ok, _ = bot.website_checkin(self.site, "张迦勒", "周读物", logical_date="2026-08-21")
-        self.assertFalse(ok)
-        post.assert_not_called()
+            self.assertFalse(ok)
+            post.assert_not_called()
+
+    def test_group_status_lists_member_names_in_website_order(self):
+        website_state = {
+            "members": ["甲", "乙", "丙"],
+            "records": [
+                {"name": "乙", "logical_date": "2026-08-21", "daily": "done"},
+                {"name": "甲", "logical_date": "2026-08-21", "daily": "done"},
+                {"name": "乙", "logical_date": "2026-08-18", "book": "done"},
+            ],
+            "weeklySchedule": self.schedule,
+        }
+        fixed_now = SimpleNamespace(date=lambda: date(2026, 8, 21))
+        with patch.object(bot, "website_snapshot", return_value=(website_state, {"weekly_schedule": self.schedule})), patch.object(bot, "now", return_value=fixed_now):
+            text = bot.website_status(self.site)
+        self.assertIn("灵修/读经（2 人）\n甲、乙", text)
+        self.assertIn("周读物（1 人）\n乙", text)
+        self.assertIn("视频（0 人）\n暂无", text)
 
     def test_loads_multiple_sites_and_rejects_duplicate_chat_routes(self):
         rows = {"sites": [
