@@ -291,6 +291,25 @@ class MenxunBotTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             bot.member_month_status(self.site, "张迦勒", "2026-09", today=date(2026, 8, 21))
 
+    def test_member_history_summary_uses_all_records_and_deduplicates_tasks(self):
+        website_state = {
+            "records": [
+                {"name": "张迦勒", "logical_date": "2026-08-18", "daily": "done", "book": "done"},
+                {"name": "张迦勒", "logical_date": "2026-08-19", "daily": "done", "book": "done"},
+                {"name": "张迦勒", "logical_date": "2026-08-20", "daily": "done", "video": "done", "is_retro": "yes"},
+                {"name": "其他人", "logical_date": "2026-08-20", "daily": "done"},
+            ],
+            "weeklySchedule": self.schedule,
+        }
+        with patch.object(bot, "website_snapshot", return_value=(website_state, {"weekly_schedule": self.schedule})):
+            text = bot.member_history_summary(self.site, "张迦勒")
+        self.assertIn("活跃：3 天｜1 个月｜共 5 项", text)
+        self.assertIn("灵修：3 天｜最长连续 3 天", text)
+        self.assertIn("周读物：1 次", text)
+        self.assertIn("视频：1 次", text)
+        self.assertIn("补签记录：1 次", text)
+        self.assertNotIn("其他人", text)
+
     def test_extracts_numbered_daily_devotion(self):
         markdown = "# 前言\n\n## 43\n\n**今日经文**\n\n这是今天的内容。\n\n## 44\n\n明天内容。"
         devotion = {

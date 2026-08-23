@@ -721,6 +721,7 @@ def help_text(site: SiteConfig | None = None) -> str:
         "查看进度",
         "我的状态 — 查看个人完成情况",
         "我的月状态 — 查看个人本月月历",
+        "门训总结 — 查看个人全部历史统计",
         "群状态 — 查看全群完成情况",
         "任务 — 查看今日和本周任务",
         "",
@@ -1073,6 +1074,98 @@ def member_month_status(
         *rows,
         "",
         "✅ 完整　🟦 已灵修　🟨 仅周任务　⬜ 未完成",
+    ])
+
+
+def member_history_summary(site: SiteConfig, name: str) -> str:
+    """统计成员在当前网站的全部历史打卡数据。"""
+    website_state, config = website_snapshot(site)
+    weekly_schedule = website_state.get("weeklySchedule") or config.get("weekly_schedule") or []
+    records = [
+        record for record in (website_state.get("records") or [])
+        if isinstance(record, dict) and record_name(record) == name.strip()
+    ]
+    labels = {
+        "每日灵修": ("daily", "每日灵修", "灵修"),
+        "周读物": ("book", "周读物", "周读物"),
+        "周视频": ("video", "周视频", "视频"),
+        "周背经": ("verse", "周背经", "背经"),
+    }
+    completions: dict[str, set[str]] = {task: set() for task in labels}
+    dated_events: list[tuple[str, datetime | None, str, bool]] = []
+    active_dates: set[str] = set()
+    retro_records: set[str] = set()
+
+    for record in records:
+        logical_date = record_logical_date(record, site)
+        if not logical_date:
+            continue
+        try:
+            target_date = date.fromisoformat(logical_date)
+        except ValueError:
+            continue
+        completed_in_record = []
+        for task, (column, chinese_column, display) in labels.items():
+            if not (is_done_value(record.get(column)) or is_done_value(record.get(chinese_column))):
+                continue
+            if task == "每日灵修":
+                identity = logical_date
+            else:
+                plan = current_week(weekly_schedule, target_date)
+                task_value = weekly_task_value(plan, task) if plan else ""
+                week_identity = str((plan or {}).get("start") or (plan or {}).get("startDate") or "")
+                identity = f"{week_identity}:{task_value}" if week_identity and task_value else f"{target_date.isocalendar().year}-W{target_date.isocalendar().week:02d}:{task_value}"
+            completions[task].add(identity)
+            completed_in_record.append(display)
+        if completed_in_record:
+            active_dates.add(logical_date)
+            event_key = f"{logical_date}:{','.join(completed_in_record)}"
+            is_retro = record_is_retro(record)
+            if is_retro:
+                retro_records.add(event_key)
+            dated_events.append((logical_date, record_datetime(record, site), "、".join(completed_in_record), is_retro))
+
+    if not active_dates:
+        return f"📈 {site.name} · 门训进度总结\n{name}\n\n暂无历史打卡数据。"
+
+    devotion_dates = sorted(date.fromisoformat(value) for value in completions["每日灵修"])
+    longest_streak = current_streak = 0
+    previous = None
+    for value in devotion_dates:
+        current_streak = current_streak + 1 if previous and value == previous + timedelta(days=1) else 1
+        longest_streak = max(longest_streak, current_streak)
+        previous = value
+
+    first_date, last_date = min(active_dates), max(active_dates)
+    active_months = len({value[:7] for value in active_dates})
+    total_items = sum(len(values) for values in completions.values())
+    fallback_time = datetime.min.replace(tzinfo=ZoneInfo(site.timezone))
+    dated_events.sort(key=lambda item: (item[0], item[1] or fallback_time), reverse=True)
+    recent_lines = []
+    seen_recent = set()
+    for logical_date, _, tasks, is_retro in dated_events:
+        key = (logical_date, tasks)
+        if key in seen_recent:
+            continue
+        seen_recent.add(key)
+        recent_lines.append(f"· {logical_date}　{tasks}{'（补签）' if is_retro else ''}")
+        if len(recent_lines) == 5:
+            break
+
+    return "\n".join([
+        f"📈 {site.name} · 门训进度总结",
+        name,
+        "",
+        f"参与时间：{first_date} 至 {last_date}",
+        f"活跃：{len(active_dates)} 天｜{active_months} 个月｜共 {total_items} 项",
+        f"灵修：{len(completions['每日灵修'])} 天｜最长连续 {longest_streak} 天",
+        f"周读物：{len(completions['周读物'])} 次",
+        f"视频：{len(completions['周视频'])} 次",
+        f"背经：{len(completions['周背经'])} 次",
+        f"补签记录：{len(retro_records)} 次",
+        "",
+        "最近完成",
+        *recent_lines,
     ])
 
 
@@ -1570,7 +1663,7 @@ def on_new_message(bot, accid: int, event) -> None:
             send(bot, accid, chat_id, daily_devotion_text(site))
             return
         if text in {"状态", "进度"}:
-            send(bot, accid, chat_id, "请选择：\n· 我的状态\n· 我的月状态\n· 群状态")
+            send(bot, accid, chat_id, "请选择：\n· 我的状态\n· 我的月状态\n· 门训总结\n· 群状态")
             return
         if text in {"群状态", "小组状态", "群进度"}:
             send(bot, accid, chat_id, website_status(site))
@@ -1589,6 +1682,10 @@ def on_new_message(bot, accid: int, event) -> None:
                 send(bot, accid, chat_id, member_month_status(site, name, month_value))
             except ValueError:
                 send(bot, accid, chat_id, "月份格式不正确。\n请发送“我的月状态”，或例如“我的月状态 2026-07”。")
+            return
+        if text in {"门训总结", "进度总结", "历史总结", "我的总结"}:
+            name = bound_name(member_id, site)
+            send(bot, accid, chat_id, member_history_summary(site, name) if name else f"请先绑定 {site.name} 的身份，例如：绑定 你的姓名")
             return
         if text.startswith("补签") or text.startswith("补打卡"):
             name = bound_name(member_id, site)
