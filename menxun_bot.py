@@ -168,6 +168,7 @@ config_cache: dict[str, tuple[float, dict]] = {}
 devotion_cache: dict[str, tuple[float, str]] = {}
 admin_attempt_lock = threading.Lock()
 admin_failed_attempts: dict[int, list[float]] = {}
+sites_lock = threading.Lock()
 
 
 @cli.on(events.RawEvent)
@@ -1474,6 +1475,7 @@ def admin_help_text() -> str:
         "管理员 网站状态 — 检查所有网站",
         "管理员 成员列表 — 查看当前网站成员",
         "管理员 群列表 — 查看网站与群 ID",
+        "管理员 绑定群 网站 群ID — 绑定通知群（仅私聊）",
         "管理员 广播 内容 — 广播到当前网站群聊",
         "管理员 发布灵修 — 将当天灵修内容发到群聊",
         "管理员 立即提醒 早间 — 立即发送早间提醒",
@@ -1487,6 +1489,57 @@ def admin_group_list_text() -> str:
         groups = "、".join(str(chat_id) for chat_id in sorted(configured_site.chat_ids)) or "未配置"
         lines.append(f"{configured_site.site_id} · {configured_site.name}：{groups}")
     return "\n".join(lines)
+
+
+def site_config_row(site: SiteConfig) -> dict:
+    return {
+        "id": site.site_id,
+        "name": site.name,
+        "url": site.url,
+        "chat_ids": sorted(site.chat_ids),
+        "timezone": site.timezone,
+        "devotion_time": site.devotion_time,
+        "morning_time": site.morning_time,
+        "evening_time": site.evening_time,
+        "enabled": True,
+    }
+
+
+def bind_group_to_site(site: SiteConfig, group_id: int) -> SiteConfig:
+    """持久化网站群 ID 并刷新内存路由，使配置立即生效。"""
+    global SITES, SITE_BY_ID, SITE_BY_CHAT_ID, DEFAULT_SITE
+    if os.getenv("MENXUN_SITES_JSON", "").strip():
+        raise RuntimeError("当前使用 MENXUN_SITES_JSON 环境变量，无法在聊天中修改群配置。")
+    existing = SITE_BY_CHAT_ID.get(group_id)
+    if existing and existing.site_id != site.site_id:
+        raise ValueError(f"群 {group_id} 已绑定到 {existing.name}。")
+    with sites_lock:
+        if SITES_FILE.exists():
+            source = json.loads(SITES_FILE.read_text(encoding="utf-8-sig"))
+        else:
+            source = {"sites": [site_config_row(item) for item in SITES]}
+        rows = source.get("sites", []) if isinstance(source, dict) else source
+        if not isinstance(rows, list):
+            raise RuntimeError("sites.json 格式错误。")
+        matched = False
+        for row in rows:
+            if isinstance(row, dict) and str(row.get("id", "")).strip().lower() == site.site_id:
+                row["chat_ids"] = sorted(set(parse_chat_ids(row.get("chat_ids", []))) | {group_id})
+                matched = True
+                break
+        if not matched:
+            raise RuntimeError(f"sites.json 中没有找到网站 {site.site_id}。")
+        payload = source if isinstance(source, dict) else rows
+        SITES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temporary = SITES_FILE.with_suffix(".tmp")
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(SITES_FILE)
+        refreshed = load_sites()
+        SITES = refreshed
+        SITE_BY_ID = {item.site_id: item for item in refreshed}
+        SITE_BY_CHAT_ID = {chat_id: item for item in refreshed for chat_id in item.chat_ids}
+        DEFAULT_SITE = refreshed[0]
+        return SITE_BY_ID[site.site_id]
 
 
 def admin_site_status_text() -> str:
@@ -1592,6 +1645,34 @@ def handle_admin_command(
         return True
     if normalized == "群列表":
         send(bot, accid, chat_id, admin_group_list_text())
+        return True
+    if normalized.startswith("绑定群"):
+        if is_group:
+            send(bot, accid, chat_id, "绑定群 ID 只能私聊机器人操作。")
+            return True
+        value = re.sub(r"^绑定群\s*[:：]?\s*", "", remainder, count=1, flags=re.IGNORECASE).strip()
+        parts = value.rsplit(maxsplit=1)
+        if len(parts) == 1 and parts[0].isdigit() and site:
+            selected_site, group_text = site, parts[0]
+        elif len(parts) == 2:
+            selected_site, group_text = find_site(parts[0]), parts[1]
+        else:
+            selected_site, group_text = None, ""
+        if not selected_site or not group_text.isdigit():
+            send(bot, accid, chat_id, "请输入：管理员 绑定群 网站名称 群ID\n例如：管理员 绑定群 科大 11")
+            return True
+        group_id = int(group_text)
+        try:
+            group_chat = bot.rpc.get_full_chat_by_id(accid, group_id)
+            if group_chat.chat_type != ChatType.GROUP or not group_chat.self_in_group:
+                send(bot, accid, chat_id, "该 ID 不是机器人当前所在的群聊。请先把机器人加入群聊。")
+                return True
+            updated_site = bind_group_to_site(selected_site, group_id)
+            send(bot, accid, chat_id, f"✅ 已绑定：{updated_site.name} → 群 {group_id}\n配置已保存并立即生效。")
+        except (ValueError, RuntimeError) as error:
+            send(bot, accid, chat_id, f"❌ {error}")
+        except Exception:
+            send(bot, accid, chat_id, "无法读取该群 ID。请确认机器人已加入该群，并检查“管理员 群列表”。")
         return True
     if normalized == "成员列表":
         if not site:

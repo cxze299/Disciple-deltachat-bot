@@ -476,6 +476,30 @@ class MenxunBotTests(unittest.TestCase):
             self.assertTrue(handled)
             broadcast.assert_called_once_with(fake_bot, 1, self.site, "📖 测试网站 · 今日灵修")
 
+    def test_admin_can_bind_group_from_private_chat(self):
+        temporary_state = {"bindings": {}, "active_sites": {}, "checkins": {}, "reminded": {}, "admins": {
+            "77": {"verified_at": "2026-08-21T10:00:00+08:00"}
+        }}
+        group = SimpleNamespace(chat_type=bot.ChatType.GROUP, self_in_group=True)
+        fake_bot = SimpleNamespace(rpc=SimpleNamespace(get_full_chat_by_id=lambda _accid, _chat_id: group))
+        updated = bot.SiteConfig(site_id="test", name="测试网站", url="https://example.test", chat_ids=frozenset({101}))
+        with patch.object(bot, "state", temporary_state), patch.object(bot, "bind_group_to_site", return_value=updated) as bind_group, patch.object(bot, "send") as send:
+            handled = bot.handle_admin_command(fake_bot, 1, 900, 77, False, self.site, "管理员 绑定群 101")
+            self.assertTrue(handled)
+            bind_group.assert_called_once_with(self.site, 101)
+            self.assertIn("立即生效", send.call_args.args[3])
+
+    def test_binding_group_updates_sites_file_and_memory_routes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            sites_file = bot.Path(folder) / "sites.json"
+            sites_file.write_text(json.dumps({"sites": [bot.site_config_row(self.site)]}, ensure_ascii=False), encoding="utf-8")
+            with patch.dict(os.environ, {"MENXUN_SITES_JSON": ""}), patch.object(bot, "SITES_FILE", sites_file), patch.object(bot, "SITES", (self.site,)), patch.object(bot, "SITE_BY_ID", {"test": self.site}), patch.object(bot, "SITE_BY_CHAT_ID", {}), patch.object(bot, "DEFAULT_SITE", self.site):
+                updated = bot.bind_group_to_site(self.site, 345)
+                self.assertIn(345, updated.chat_ids)
+                self.assertEqual(bot.SITE_BY_CHAT_ID[345].site_id, "test")
+                saved = json.loads(sites_file.read_text(encoding="utf-8"))
+                self.assertEqual(saved["sites"][0]["chat_ids"], [101, 345])
+
     def test_health_heartbeat_is_accepted_by_container_check(self):
         with tempfile.TemporaryDirectory() as folder:
             health_file = bot.Path(folder) / "health.json"
