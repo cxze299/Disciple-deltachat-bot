@@ -202,6 +202,7 @@ def load_state() -> dict:
     loaded.setdefault("website_records", {})
     loaded.setdefault("recent_announcements", {})
     loaded.setdefault("warm_reminders", {})
+    loaded.setdefault("member_join_dates", {})
     if not isinstance(loaded["admins"], dict):
         loaded["admins"] = {}
     if not isinstance(loaded["welcomed"], dict):
@@ -212,6 +213,8 @@ def load_state() -> dict:
         loaded["recent_announcements"] = {}
     if not isinstance(loaded["warm_reminders"], dict):
         loaded["warm_reminders"] = {}
+    if not isinstance(loaded["member_join_dates"], dict):
+        loaded["member_join_dates"] = {}
     return loaded
 
 
@@ -1133,119 +1136,115 @@ def member_month_status(
 
 
 def member_history_summary(site: SiteConfig, name: str, today: date | None = None) -> str:
-    """统计成员在当前网站的全部历史打卡数据。"""
+    """按加入日期和网站历史任务配置统计成员进度。"""
+    current_day = today or now(site).date()
     website_state, config = website_snapshot(site)
     weekly_schedule = website_state.get("weeklySchedule") or config.get("weekly_schedule") or []
-    records = [
-        record for record in (website_state.get("records") or [])
-        if isinstance(record, dict) and record_name(record) == name.strip()
-    ]
+    records = [record for record in (website_state.get("records") or []) if isinstance(record, dict) and record_name(record) == name.strip()]
     labels = {
         "每日灵修": ("daily", "每日灵修", "灵修"),
         "周读物": ("book", "周读物", "周读物"),
         "周视频": ("video", "周视频", "视频"),
         "周背经": ("verse", "周背经", "背经"),
     }
-    completions: dict[str, set[str]] = {task: set() for task in labels}
-    dated_events: list[tuple[str, datetime | None, str, bool]] = []
-    active_dates: set[str] = set()
-    retro_records: set[str] = set()
 
+    parsed_records: list[tuple[dict, date]] = []
+    future_count = invalid_count = 0
     for record in records:
-        logical_date = record_logical_date(record, site)
-        if not logical_date:
-            continue
         try:
-            target_date = date.fromisoformat(logical_date)
+            logical_day = date.fromisoformat(record_logical_date(record, site))
         except ValueError:
+            invalid_count += 1
             continue
+        if logical_day > current_day:
+            future_count += 1
+            continue
+        parsed_records.append((record, logical_day))
+
+    configured_start = str(state.get("member_join_dates", {}).get(f"{site.site_id}:{name}", ""))
+    try:
+        join_day = date.fromisoformat(configured_start)
+    except ValueError:
+        normal_days = [day for record, day in parsed_records if not record_is_retro(record)]
+        all_days = [day for _, day in parsed_records]
+        join_day = min(normal_days or all_days) if all_days else current_day
+    join_day = min(max(join_day, date(2000, 1, 1)), current_day)
+
+    required_ids: dict[str, set[str]] = {task: set() for task in labels}
+    cursor = join_day
+    while cursor <= current_day:
+        required_ids["每日灵修"].add(cursor.isoformat())
+        plan = current_week(weekly_schedule, cursor)
+        if plan:
+            week_id = str(plan.get("start") or f"{cursor.isocalendar().year}-W{cursor.isocalendar().week:02d}")
+            for task in ("周读物", "周视频", "周背经"):
+                if weekly_task_value(plan, task):
+                    required_ids[task].add(week_id)
+        cursor += timedelta(days=1)
+
+    completions: dict[str, set[str]] = {task: set() for task in labels}
+    dated_events: list[tuple[date, datetime | None, str, bool]] = []
+    active_dates: set[date] = set()
+    retro_events: set[str] = set()
+    extra_count = 0
+    for record, logical_day in parsed_records:
         completed_in_record = []
         for task, (column, chinese_column, display) in labels.items():
             if not (is_done_value(record.get(column)) or is_done_value(record.get(chinese_column))):
                 continue
-            if task == "每日灵修":
-                identity = logical_date
-            else:
-                plan = current_week(weekly_schedule, target_date)
-                task_value = weekly_task_value(plan, task) if plan else ""
-                week_identity = str((plan or {}).get("start") or (plan or {}).get("startDate") or "")
-                identity = f"{week_identity}:{task_value}" if week_identity and task_value else f"{target_date.isocalendar().year}-W{target_date.isocalendar().week:02d}:{task_value}"
+            plan = current_week(weekly_schedule, logical_day) if task != "每日灵修" else None
+            identity = logical_day.isoformat() if task == "每日灵修" else str((plan or {}).get("start") or f"{logical_day.isocalendar().year}-W{logical_day.isocalendar().week:02d}")
+            if logical_day < join_day or identity not in required_ids[task]:
+                extra_count += 1
+                continue
             completions[task].add(identity)
             completed_in_record.append(display)
         if completed_in_record:
-            active_dates.add(logical_date)
-            event_key = f"{logical_date}:{','.join(completed_in_record)}"
+            active_dates.add(logical_day)
             is_retro = record_is_retro(record)
+            event_key = f"{logical_day.isoformat()}:{','.join(completed_in_record)}"
             if is_retro:
-                retro_records.add(event_key)
-            dated_events.append((logical_date, record_datetime(record, site), "、".join(completed_in_record), is_retro))
-
-    if not active_dates:
-        return f"📈 {site.name} · 门训进度总结\n{name}\n\n暂无历史打卡数据。"
+                retro_events.add(event_key)
+            dated_events.append((logical_day, record_datetime(record, site), "、".join(completed_in_record), is_retro))
 
     devotion_dates = sorted(date.fromisoformat(value) for value in completions["每日灵修"])
-    longest_streak = current_streak = 0
+    longest_streak = streak = 0
     previous = None
     for value in devotion_dates:
-        current_streak = current_streak + 1 if previous and value == previous + timedelta(days=1) else 1
-        longest_streak = max(longest_streak, current_streak)
+        streak = streak + 1 if previous and value == previous + timedelta(days=1) else 1
+        longest_streak = max(longest_streak, streak)
         previous = value
 
-    first_date, last_date = min(active_dates), max(active_dates)
-    first_day = date.fromisoformat(first_date)
-    current_day = today or now(site).date()
-    if current_day < first_day:
-        current_day = first_day
-    required: dict[str, int] = {
-        "每日灵修": (current_day - first_day).days + 1,
-        "周读物": 0,
-        "周视频": 0,
-        "周背经": 0,
-    }
-    required_weekly: dict[str, set[str]] = {task: set() for task in ("周读物", "周视频", "周背经")}
-    cursor = first_day
-    while cursor <= current_day:
-        plan = current_week(weekly_schedule, cursor)
-        if plan:
-            week_identity = str(plan.get("start") or plan.get("startDate") or f"{cursor.isocalendar().year}-W{cursor.isocalendar().week:02d}")
-            for task in required_weekly:
-                if weekly_task_value(plan, task):
-                    required_weekly[task].add(week_identity)
-        cursor += timedelta(days=1)
-    for task, identities in required_weekly.items():
-        required[task] = len(identities)
-    active_months = len({value[:7] for value in active_dates})
     total_items = sum(len(values) for values in completions.values())
-    total_required = sum(required.values())
+    total_required = sum(len(values) for values in required_ids.values())
     fallback_time = datetime.min.replace(tzinfo=ZoneInfo(site.timezone))
     dated_events.sort(key=lambda item: (item[0], item[1] or fallback_time), reverse=True)
     recent_lines = []
     seen_recent = set()
-    for logical_date, _, tasks, is_retro in dated_events:
-        key = (logical_date, tasks)
+    for logical_day, _, tasks, is_retro in dated_events:
+        key = (logical_day, tasks)
         if key in seen_recent:
             continue
         seen_recent.add(key)
-        recent_lines.append(f"· {logical_date}　{tasks}{'（补签）' if is_retro else ''}")
+        recent_lines.append(f"· {logical_day.isoformat()}　{tasks}{'（补签）' if is_retro else ''}")
         if len(recent_lines) == 5:
             break
-
-    return "\n".join([
-        f"📈 {site.name} · 门训进度总结",
-        name,
-        "",
-        f"参与时间：{first_date} 至 {last_date}",
+    anomaly_count = extra_count + future_count + invalid_count
+    lines = [
+        f"📈 {site.name} · 门训进度总结", name, "",
+        f"统计周期：{join_day.isoformat()} 至 {current_day.isoformat()}",
         f"总进度：{total_items}/{total_required} 项（完成/需要）",
-        f"活跃：{len(active_dates)} 天｜{active_months} 个月",
-        f"灵修：{len(completions['每日灵修'])}/{required['每日灵修']} 天｜最长连续 {longest_streak} 天",
-        f"周读物：{len(completions['周读物'])}/{required['周读物']} 次",
-        f"视频：{len(completions['周视频'])}/{required['周视频']} 次",
-        f"背经：{len(completions['周背经'])}/{required['周背经']} 次",
-        f"补签记录：{len(retro_records)} 次",
-        "",
-        "最近完成",
-        *recent_lines,
-    ])
+        f"活跃：{len(active_dates)} 天｜{len({value.strftime('%Y-%m') for value in active_dates})} 个月",
+        f"灵修：{len(completions['每日灵修'])}/{len(required_ids['每日灵修'])} 天｜最长连续 {longest_streak} 天",
+        f"周读物：{len(completions['周读物'])}/{len(required_ids['周读物'])} 次",
+        f"视频：{len(completions['周视频'])}/{len(required_ids['周视频'])} 次",
+        f"背经：{len(completions['周背经'])}/{len(required_ids['周背经'])} 次",
+        f"补签记录：{len(retro_events)} 次",
+    ]
+    if anomaly_count:
+        lines.append(f"未计入异常记录：{anomaly_count} 项（统计期外、未来日期或无任务配置）")
+    lines.extend(["", "最近完成", *(recent_lines or ["暂无有效记录"])])
+    return "\n".join(lines)
 
 
 def record_datetime(record: dict, site: SiteConfig) -> datetime | None:
@@ -1500,6 +1499,7 @@ def admin_help_text() -> str:
         "管理员 成员列表 — 查看当前网站成员",
         "管理员 群列表 — 查看网站与群 ID",
         "管理员 绑定群 网站 群ID — 绑定通知群（仅私聊）",
+        "管理员 设置加入日期 网站 姓名 日期 — 修正统计起点（仅私聊）",
         "管理员 广播 内容 — 广播到当前网站群聊",
         "管理员 发布灵修 — 将当天灵修内容发到群聊",
         "管理员 立即提醒 早间 — 立即发送早间提醒",
@@ -1697,6 +1697,39 @@ def handle_admin_command(
             send(bot, accid, chat_id, f"❌ {error}")
         except Exception:
             send(bot, accid, chat_id, "无法读取该群 ID。请确认机器人已加入该群，并检查“管理员 群列表”。")
+        return True
+    if normalized.startswith("设置加入日期"):
+        if is_group:
+            send(bot, accid, chat_id, "设置加入日期只能私聊机器人操作。")
+            return True
+        value = re.sub(r"^设置加入日期\s*[:：]?\s*", "", remainder, count=1, flags=re.IGNORECASE).strip()
+        prefix, separator, date_text = value.rpartition(" ")
+        selected_site = site
+        target_name = prefix.strip()
+        first, space, rest = target_name.partition(" ")
+        explicit_site = find_site(first) if space else None
+        if explicit_site:
+            selected_site, target_name = explicit_site, rest.strip()
+        try:
+            join_day = date.fromisoformat(date_text.strip()) if separator else None
+        except ValueError:
+            join_day = None
+        if not selected_site or not target_name or not join_day:
+            send(bot, accid, chat_id, "请输入：管理员 设置加入日期 网站 姓名 YYYY-MM-DD\n例如：管理员 设置加入日期 科大 张三 2026-01-01")
+            return True
+        current_day = now(selected_site).date()
+        if join_day < date(2000, 1, 1) or join_day > current_day:
+            send(bot, accid, chat_id, f"加入日期必须在 2000-01-01 至 {current_day.isoformat()} 之间。")
+            return True
+        website_state, _ = website_snapshot(selected_site)
+        members = {str(item).strip() for item in website_state.get("members") or []}
+        if target_name not in members:
+            send(bot, accid, chat_id, f"{selected_site.name} 的成员名单中没有“{target_name}”。")
+            return True
+        with state_lock:
+            state["member_join_dates"][f"{selected_site.site_id}:{target_name}"] = join_day.isoformat()
+            save_state()
+        send(bot, accid, chat_id, f"✅ 已设置：{selected_site.name} / {target_name} / 加入日期 {join_day.isoformat()}\n门训总结将立即按新起点计算。")
         return True
     if normalized == "成员列表":
         if not site:

@@ -312,6 +312,29 @@ class MenxunBotTests(unittest.TestCase):
         self.assertIn("补签记录：1 次", text)
         self.assertNotIn("其他人", text)
 
+    def test_history_summary_excludes_future_unconfigured_and_pre_join_records(self):
+        website_state = {"records": [
+            {"name": "甲", "logical_date": "2025-01-01", "daily": "done", "is_retro": "yes"},
+            {"name": "甲", "logical_date": "2026-08-24", "daily": "done", "book": "done"},
+            {"name": "甲", "logical_date": "2026-08-30", "daily": "done"},
+        ]}
+        temporary_state = {"member_join_dates": {}}
+        with patch.object(bot, "state", temporary_state), patch.object(bot, "website_snapshot", return_value=(website_state, {})):
+            text = bot.member_history_summary(self.site, "甲", today=date(2026, 8, 24))
+        self.assertIn("统计周期：2026-08-24 至 2026-08-24", text)
+        self.assertIn("总进度：1/1 项", text)
+        self.assertIn("灵修：1/1 天", text)
+        self.assertIn("周读物：0/0 次", text)
+        self.assertIn("未计入异常记录：3 项", text)
+
+    def test_configured_join_date_controls_history_denominator(self):
+        website_state = {"records": [{"name": "甲", "logical_date": "2026-08-24", "daily": "done"}]}
+        temporary_state = {"member_join_dates": {"test:甲": "2026-08-22"}}
+        with patch.object(bot, "state", temporary_state), patch.object(bot, "website_snapshot", return_value=(website_state, {})):
+            text = bot.member_history_summary(self.site, "甲", today=date(2026, 8, 24))
+        self.assertIn("统计周期：2026-08-22 至 2026-08-24", text)
+        self.assertIn("灵修：1/3 天", text)
+
     def test_warm_reminder_privately_messages_bound_member_and_rate_limits(self):
         temporary_state = {
             "bindings": {"77": {"test": "甲"}, "88": {"test": "乙"}},
@@ -490,6 +513,16 @@ class MenxunBotTests(unittest.TestCase):
             self.assertTrue(handled)
             bind_group.assert_called_once_with(self.site, 101)
             self.assertIn("立即生效", send.call_args.args[3])
+
+    def test_admin_can_set_member_join_date_from_private_chat(self):
+        temporary_state = {"admins": {"77": {}}, "member_join_dates": {}}
+        fake_bot = SimpleNamespace()
+        fixed_now = datetime(2026, 8, 24, 10, 0)
+        with patch.object(bot, "state", temporary_state), patch.object(bot, "save_state"), patch.object(bot, "website_snapshot", return_value=({"members": ["甲"]}, {})), patch.object(bot, "now", return_value=fixed_now), patch.object(bot, "send") as send:
+            handled = bot.handle_admin_command(fake_bot, 1, 900, 77, False, self.site, "管理员 设置加入日期 甲 2026-08-01")
+            self.assertTrue(handled)
+            self.assertEqual(temporary_state["member_join_dates"]["test:甲"], "2026-08-01")
+            self.assertIn("立即按新起点", send.call_args.args[3])
 
     def test_binding_group_updates_sites_file_and_memory_routes(self):
         with tempfile.TemporaryDirectory() as folder:
