@@ -34,6 +34,7 @@ TIMEZONE = os.getenv("BOT_TIMEZONE", "Asia/Shanghai")
 WEBSITE_URL = os.getenv("MENXUN_WEBSITE_URL", "http://127.0.0.1:3000").rstrip("/")
 MORNING_REMINDER_TIME = os.getenv("MORNING_REMINDER_TIME", "08:30")
 EVENING_REMINDER_TIME = os.getenv("EVENING_REMINDER_TIME", os.getenv("REMINDER_TIME", "20:30"))
+DEVOTION_PUBLISH_TIME = os.getenv("DEVOTION_PUBLISH_TIME", "08:00")
 CHAT_IDS = {int(x) for x in os.getenv("CHAT_IDS", "").split(",") if x.strip().isdigit()}
 try:
     WEBSITE_POLL_INTERVAL = min(60.0, max(2.0, float(os.getenv("WEBSITE_POLL_INTERVAL", "5"))))
@@ -50,6 +51,7 @@ class SiteConfig:
     url: str
     chat_ids: frozenset[int]
     timezone: str = TIMEZONE
+    devotion_time: str = DEVOTION_PUBLISH_TIME
     morning_time: str = MORNING_REMINDER_TIME
     evening_time: str = EVENING_REMINDER_TIME
 
@@ -94,6 +96,7 @@ def load_sites() -> tuple[SiteConfig, ...]:
             "url": WEBSITE_URL,
             "chat_ids": sorted(CHAT_IDS),
             "timezone": TIMEZONE,
+            "devotion_time": DEVOTION_PUBLISH_TIME,
             "morning_time": MORNING_REMINDER_TIME,
             "evening_time": EVENING_REMINDER_TIME,
         }]
@@ -125,6 +128,11 @@ def load_sites() -> tuple[SiteConfig, ...]:
             site_id,
             "morning_time",
         )
+        devotion_time = validate_reminder_time(
+            row.get("devotion_time") or row.get("devotionTime") or DEVOTION_PUBLISH_TIME,
+            site_id,
+            "devotion_time",
+        )
         evening_time = validate_reminder_time(
             row.get("evening_time") or row.get("eveningTime") or EVENING_REMINDER_TIME,
             site_id,
@@ -138,6 +146,7 @@ def load_sites() -> tuple[SiteConfig, ...]:
             url=validate_site_url(row.get("url")),
             chat_ids=chat_ids,
             timezone=timezone,
+            devotion_time=devotion_time,
             morning_time=morning_time,
             evening_time=evening_time,
         ))
@@ -1319,6 +1328,7 @@ def admin_help_text() -> str:
         "管理员 成员列表 — 查看当前网站成员",
         "管理员 群列表 — 查看网站与群 ID",
         "管理员 广播 内容 — 广播到当前网站群聊",
+        "管理员 发布灵修 — 将当天灵修内容发到群聊",
         "管理员 立即提醒 早间 — 立即发送早间提醒",
         "管理员 立即提醒 晚间 — 立即发送晚间提醒",
     ])
@@ -1453,6 +1463,17 @@ def handle_admin_command(
         message = f"📢 {site.name} · 管理员公告\n\n{content}"
         delivered = broadcast_group_update(bot, accid, site, message)
         send(bot, accid, chat_id, f"✅ 广播完成：已发送到 {delivered} 个群。")
+        return True
+    if normalized in {"发布灵修", "发送灵修", "发灵修"}:
+        if not site:
+            send(bot, accid, chat_id, "请先选择要发布灵修的网站。")
+            return True
+        message = daily_devotion_text(site)
+        delivered = broadcast_group_update(bot, accid, site, message)
+        if is_group and chat_id in site.chat_ids:
+            send(bot, accid, chat_id, f"✅ 今日灵修已发布。")
+        else:
+            send(bot, accid, chat_id, f"✅ 今日灵修已发送到 {delivered} 个群。")
         return True
     if normalized.startswith("立即提醒"):
         if not site:
@@ -1717,7 +1738,9 @@ def reminder_loop(bot, accid: int) -> None:
             except Exception as error:
                 bot.logger.exception("监听网站打卡失败：site=%s error=%s", site.site_id, error)
             current = now(site)
-            if reminder_due(current, site.morning_time):
+            if reminder_due(current, site.devotion_time):
+                reminder_kind = "devotion"
+            elif reminder_due(current, site.morning_time):
                 reminder_kind = "morning"
             elif reminder_due(current, site.evening_time):
                 reminder_kind = "evening"
@@ -1730,7 +1753,11 @@ def reminder_loop(bot, accid: int) -> None:
             ]
             if not pending_chat_ids:
                 continue
-            message = build_reminder_message(bot, site, reminder_kind)
+            try:
+                message = daily_devotion_text(site) if reminder_kind == "devotion" else build_reminder_message(bot, site, reminder_kind)
+            except Exception as error:
+                bot.logger.exception("读取定时灵修失败，将在下一轮重试：site=%s error=%s", site.site_id, error)
+                continue
             for chat_id in pending_chat_ids:
                 try:
                     send(bot, accid, chat_id, message)
@@ -1753,11 +1780,12 @@ def on_start(bot, args) -> None:
             threading.Thread(target=reminder_loop, args=(bot, accounts[0]), daemon=True).start()
     for site in SITES:
         bot.logger.info(
-            "网站已加载：id=%s name=%s url=%s chat_ids=%s reminders=%s/%s timezone=%s",
+            "网站已加载：id=%s name=%s url=%s chat_ids=%s devotion=%s reminders=%s/%s timezone=%s",
             site.site_id,
             site.name,
             site.url,
             sorted(site.chat_ids),
+            site.devotion_time,
             site.morning_time,
             site.evening_time,
             site.timezone,

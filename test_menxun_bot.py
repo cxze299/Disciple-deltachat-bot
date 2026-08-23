@@ -428,6 +428,18 @@ class MenxunBotTests(unittest.TestCase):
             bot.handle_admin_command(fake_bot, 1, 900, 77, False, self.site, "管理员 广播 测试公告")
             broadcast.assert_called_once_with(fake_bot, 1, self.site, "📢 测试网站 · 管理员公告\n\n测试公告")
 
+    def test_bound_admin_can_publish_daily_devotion_from_group(self):
+        fake_bot = SimpleNamespace()
+        temporary_state = {"bindings": {}, "active_sites": {}, "checkins": {}, "reminded": {}, "admins": {
+            "77": {"verified_at": "2026-08-21T10:00:00+08:00"}
+        }}
+        with patch.object(bot, "state", temporary_state), patch.object(
+            bot, "daily_devotion_text", return_value="📖 测试网站 · 今日灵修"
+        ), patch.object(bot, "broadcast_group_update", return_value=1) as broadcast, patch.object(bot, "send"):
+            handled = bot.handle_admin_command(fake_bot, 1, 101, 77, True, self.site, "管理员 发布灵修")
+            self.assertTrue(handled)
+            broadcast.assert_called_once_with(fake_bot, 1, self.site, "📖 测试网站 · 今日灵修")
+
     def test_health_heartbeat_is_accepted_by_container_check(self):
         with tempfile.TemporaryDirectory() as folder:
             health_file = bot.Path(folder) / "health.json"
