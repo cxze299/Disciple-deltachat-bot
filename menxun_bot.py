@@ -1132,7 +1132,7 @@ def member_month_status(
     ])
 
 
-def member_history_summary(site: SiteConfig, name: str) -> str:
+def member_history_summary(site: SiteConfig, name: str, today: date | None = None) -> str:
     """统计成员在当前网站的全部历史打卡数据。"""
     website_state, config = website_snapshot(site)
     weekly_schedule = website_state.get("weeklySchedule") or config.get("weekly_schedule") or []
@@ -1192,8 +1192,31 @@ def member_history_summary(site: SiteConfig, name: str) -> str:
         previous = value
 
     first_date, last_date = min(active_dates), max(active_dates)
+    first_day = date.fromisoformat(first_date)
+    current_day = today or now(site).date()
+    if current_day < first_day:
+        current_day = first_day
+    required: dict[str, int] = {
+        "每日灵修": (current_day - first_day).days + 1,
+        "周读物": 0,
+        "周视频": 0,
+        "周背经": 0,
+    }
+    required_weekly: dict[str, set[str]] = {task: set() for task in ("周读物", "周视频", "周背经")}
+    cursor = first_day
+    while cursor <= current_day:
+        plan = current_week(weekly_schedule, cursor)
+        if plan:
+            week_identity = str(plan.get("start") or plan.get("startDate") or f"{cursor.isocalendar().year}-W{cursor.isocalendar().week:02d}")
+            for task in required_weekly:
+                if weekly_task_value(plan, task):
+                    required_weekly[task].add(week_identity)
+        cursor += timedelta(days=1)
+    for task, identities in required_weekly.items():
+        required[task] = len(identities)
     active_months = len({value[:7] for value in active_dates})
     total_items = sum(len(values) for values in completions.values())
+    total_required = sum(required.values())
     fallback_time = datetime.min.replace(tzinfo=ZoneInfo(site.timezone))
     dated_events.sort(key=lambda item: (item[0], item[1] or fallback_time), reverse=True)
     recent_lines = []
@@ -1212,11 +1235,12 @@ def member_history_summary(site: SiteConfig, name: str) -> str:
         name,
         "",
         f"参与时间：{first_date} 至 {last_date}",
-        f"活跃：{len(active_dates)} 天｜{active_months} 个月｜共 {total_items} 项",
-        f"灵修：{len(completions['每日灵修'])} 天｜最长连续 {longest_streak} 天",
-        f"周读物：{len(completions['周读物'])} 次",
-        f"视频：{len(completions['周视频'])} 次",
-        f"背经：{len(completions['周背经'])} 次",
+        f"总进度：{total_items}/{total_required} 项（完成/需要）",
+        f"活跃：{len(active_dates)} 天｜{active_months} 个月",
+        f"灵修：{len(completions['每日灵修'])}/{required['每日灵修']} 天｜最长连续 {longest_streak} 天",
+        f"周读物：{len(completions['周读物'])}/{required['周读物']} 次",
+        f"视频：{len(completions['周视频'])}/{required['周视频']} 次",
+        f"背经：{len(completions['周背经'])}/{required['周背经']} 次",
         f"补签记录：{len(retro_records)} 次",
         "",
         "最近完成",

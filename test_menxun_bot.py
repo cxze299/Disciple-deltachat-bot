@@ -302,11 +302,13 @@ class MenxunBotTests(unittest.TestCase):
             "weeklySchedule": self.schedule,
         }
         with patch.object(bot, "website_snapshot", return_value=(website_state, {"weekly_schedule": self.schedule})):
-            text = bot.member_history_summary(self.site, "张迦勒")
-        self.assertIn("活跃：3 天｜1 个月｜共 5 项", text)
-        self.assertIn("灵修：3 天｜最长连续 3 天", text)
-        self.assertIn("周读物：1 次", text)
-        self.assertIn("视频：1 次", text)
+            text = bot.member_history_summary(self.site, "张迦勒", today=date(2026, 8, 21))
+        self.assertIn("总进度：5/7 项（完成/需要）", text)
+        self.assertIn("活跃：3 天｜1 个月", text)
+        self.assertIn("灵修：3/4 天｜最长连续 3 天", text)
+        self.assertIn("周读物：1/1 次", text)
+        self.assertIn("视频：1/1 次", text)
+        self.assertIn("背经：0/1 次", text)
         self.assertIn("补签记录：1 次", text)
         self.assertNotIn("其他人", text)
 
