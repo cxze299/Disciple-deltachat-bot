@@ -310,6 +310,23 @@ class MenxunBotTests(unittest.TestCase):
         self.assertIn("补签记录：1 次", text)
         self.assertNotIn("其他人", text)
 
+    def test_warm_reminder_privately_messages_bound_member_and_rate_limits(self):
+        temporary_state = {
+            "bindings": {"77": {"test": "甲"}, "88": {"test": "乙"}},
+            "warm_reminders": {},
+        }
+        fake_rpc = SimpleNamespace(create_chat_by_contact_id=lambda _accid, contact_id: contact_id + 1000)
+        fake_bot = SimpleNamespace(rpc=fake_rpc, logger=SimpleNamespace(warning=lambda *_args: None))
+        with patch.object(bot, "state", temporary_state), patch.object(bot, "save_state"), patch.object(bot, "send") as send, patch.object(bot.time, "time", return_value=100000):
+            ok, result = bot.send_warm_reminder(fake_bot, 1, self.site, 77, "乙")
+            self.assertTrue(ok)
+            self.assertIn("已把暖心提醒", result)
+            self.assertEqual(send.call_args.args[2], 1088)
+            self.assertIn("甲想温柔地提醒你", send.call_args.args[3])
+            ok, result = bot.send_warm_reminder(fake_bot, 1, self.site, 77, "乙")
+            self.assertFalse(ok)
+            self.assertIn("6 小时", result)
+
     def test_extracts_numbered_daily_devotion(self):
         markdown = "# 前言\n\n## 43\n\n**今日经文**\n\n这是今天的内容。\n\n## 44\n\n明天内容。"
         devotion = {

@@ -200,6 +200,7 @@ def load_state() -> dict:
     loaded.setdefault("welcomed", {})
     loaded.setdefault("website_records", {})
     loaded.setdefault("recent_announcements", {})
+    loaded.setdefault("warm_reminders", {})
     if not isinstance(loaded["admins"], dict):
         loaded["admins"] = {}
     if not isinstance(loaded["welcomed"], dict):
@@ -208,6 +209,8 @@ def load_state() -> dict:
         loaded["website_records"] = {}
     if not isinstance(loaded["recent_announcements"], dict):
         loaded["recent_announcements"] = {}
+    if not isinstance(loaded["warm_reminders"], dict):
+        loaded["warm_reminders"] = {}
     return loaded
 
 
@@ -717,6 +720,7 @@ def help_text(site: SiteConfig | None = None) -> str:
         "打卡 背经",
         "补签 项目 日期",
         "取消打卡 项目 日期",
+        "提醒 姓名 — 私聊发送暖心提醒",
         "",
         "查看进度",
         "我的状态 — 查看个人完成情况",
@@ -772,6 +776,56 @@ def bind_member(member_id: int, site: SiteConfig, name: str, members: list[str])
         state["active_sites"][member_key] = site.site_id
         save_state()
     return True
+
+
+def bound_member_ids(site: SiteConfig, name: str) -> list[int]:
+    """查找在指定网站绑定了该姓名的 Delta Chat 联系人。"""
+    result = []
+    for member_key, binding in state["bindings"].items():
+        bound = binding if isinstance(binding, str) and site == DEFAULT_SITE else binding.get(site.site_id, "") if isinstance(binding, dict) else ""
+        if str(bound).strip() == name.strip() and str(member_key).isdigit():
+            result.append(int(member_key))
+    return sorted(set(result))
+
+
+def send_warm_reminder(bot, accid: int, site: SiteConfig, sender_id: int, target_name: str) -> tuple[bool, str]:
+    """向同网站已绑定成员发送固定内容的暖心提醒，并限制重复发送。"""
+    sender_name = bound_name(sender_id, site)
+    if not sender_name:
+        return False, f"请先绑定 {site.name} 的身份，例如：绑定 你的姓名"
+    if sender_name == target_name:
+        return False, "不能给自己发送暖心提醒。"
+    target_ids = [member_id for member_id in bound_member_ids(site, target_name) if member_id != sender_id]
+    if not target_ids:
+        return False, f"没有找到已绑定“{target_name}”的机器人用户。请确认姓名与网站成员名单一致。"
+    reminder_key = f"{site.site_id}:{sender_id}:{target_name}"
+    last_sent = float(state["warm_reminders"].get(reminder_key, 0) or 0)
+    remaining = 6 * 3600 - (time.time() - last_sent)
+    if remaining > 0:
+        hours = max(1, int((remaining + 3599) // 3600))
+        return False, f"暖心提醒已经送达，请约 {hours} 小时后再提醒同一位伙伴。"
+    message = "\n".join([
+        "💛 暖心提醒",
+        "",
+        f"{target_name}，{sender_name}想温柔地提醒你：",
+        "今天也记得留一点时间亲近神、完成门训。愿你在忙碌中仍有平安和力量。",
+        "",
+        f"来自：{site.name}的门训伙伴 {sender_name}",
+    ])
+    delivered = 0
+    for target_id in target_ids:
+        try:
+            target_chat_id = bot.rpc.create_chat_by_contact_id(accid, target_id)
+            send(bot, accid, target_chat_id, message)
+            delivered += 1
+        except Exception as error:
+            bot.logger.warning("发送暖心提醒失败：site=%s target_id=%s error=%s", site.site_id, target_id, error)
+    if delivered:
+        with state_lock:
+            state["warm_reminders"][reminder_key] = time.time()
+            save_state()
+        return True, f"💛 已把暖心提醒私聊发送给 {target_name}。"
+    return False, "暖心提醒发送失败，请稍后再试。"
 
 
 def site_list_text(member_id: int = 0) -> str:
@@ -1661,6 +1715,17 @@ def on_new_message(bot, accid: int, event) -> None:
             return
         if text in {"灵修", "今日灵修", "灵修内容"}:
             send(bot, accid, chat_id, daily_devotion_text(site))
+            return
+        if text.startswith("提醒") and text != "提醒":
+            if is_group:
+                send(bot, accid, chat_id, "暖心提醒只能私聊机器人发送。")
+                return
+            target_name = re.sub(r"^提醒\s*[:：]?\s*", "", command_text, count=1).strip()
+            if not target_name:
+                send(bot, accid, chat_id, "请输入：提醒 对方姓名\n例如：提醒 张三")
+                return
+            _, result = send_warm_reminder(bot, accid, site, member_id, target_name)
+            send(bot, accid, chat_id, result)
             return
         if text in {"状态", "进度"}:
             send(bot, accid, chat_id, "请选择：\n· 我的状态\n· 我的月状态\n· 门训总结\n· 群状态")
