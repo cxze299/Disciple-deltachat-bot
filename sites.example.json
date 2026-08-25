@@ -6,6 +6,7 @@
       "url": "https://your-nas.example.com:1777",
       "chat_ids": [],
       "timezone": "Asia/Shanghai",
+      "devotion_time": "06:00",
       "morning_time": "08:30",
       "evening_time": "20:30",
       "enabled": true

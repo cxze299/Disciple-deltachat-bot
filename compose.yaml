@@ -13,7 +13,7 @@ services:
       BOT_NAME: "${BOT_NAME:-门训同行}"
       BOT_TIMEZONE: "${BOT_TIMEZONE:-Asia/Shanghai}"
       WEBSITE_POLL_INTERVAL: "${WEBSITE_POLL_INTERVAL:-5}"
-      DEVOTION_PUBLISH_TIME: "${DEVOTION_PUBLISH_TIME:-08:00}"
+      DEVOTION_PUBLISH_TIME: "${DEVOTION_PUBLISH_TIME:-06:00}"
       MENXUN_DATA_DIR: /data
       MENXUN_SITES_FILE: /config/sites.json
       MENXUN_ADMIN_KEY_FILE: /data/admin-key.json

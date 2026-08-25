@@ -495,11 +495,21 @@ class MenxunBotTests(unittest.TestCase):
             "77": {"verified_at": "2026-08-21T10:00:00+08:00"}
         }}
         with patch.object(bot, "state", temporary_state), patch.object(
-            bot, "daily_devotion_text", return_value="📖 测试网站 · 今日灵修"
-        ), patch.object(bot, "broadcast_group_update", return_value=1) as broadcast, patch.object(bot, "send"):
+            bot, "publish_daily_devotion", return_value=1
+        ) as publish, patch.object(bot, "send"):
             handled = bot.handle_admin_command(fake_bot, 1, 101, 77, True, self.site, "管理员 发布灵修")
             self.assertTrue(handled)
-            broadcast.assert_called_once_with(fake_bot, 1, self.site, "📖 测试网站 · 今日灵修")
+            publish.assert_called_once_with(fake_bot, 1, self.site)
+
+    def test_manual_devotion_publish_marks_today_so_scheduler_skips_it(self):
+        temporary_state = {"reminded": {}}
+        fixed_now = datetime(2026, 8, 25, 5, 30)
+        fake_bot = SimpleNamespace(logger=SimpleNamespace(exception=lambda *_args: None))
+        with patch.object(bot, "state", temporary_state), patch.object(bot, "save_state"), patch.object(bot, "now", return_value=fixed_now), patch.object(bot, "send") as send:
+            delivered = bot.publish_daily_devotion(fake_bot, 1, self.site, "今日灵修")
+        self.assertEqual(delivered, 1)
+        send.assert_called_once_with(fake_bot, 1, 101, "今日灵修")
+        self.assertIn("test:2026-08-25:devotion:101", temporary_state["reminded"])
 
     def test_admin_can_bind_group_from_private_chat(self):
         temporary_state = {"bindings": {}, "active_sites": {}, "checkins": {}, "reminded": {}, "admins": {

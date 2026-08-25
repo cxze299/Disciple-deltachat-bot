@@ -34,7 +34,7 @@ TIMEZONE = os.getenv("BOT_TIMEZONE", "Asia/Shanghai")
 WEBSITE_URL = os.getenv("MENXUN_WEBSITE_URL", "http://127.0.0.1:3000").rstrip("/")
 MORNING_REMINDER_TIME = os.getenv("MORNING_REMINDER_TIME", "08:30")
 EVENING_REMINDER_TIME = os.getenv("EVENING_REMINDER_TIME", os.getenv("REMINDER_TIME", "20:30"))
-DEVOTION_PUBLISH_TIME = os.getenv("DEVOTION_PUBLISH_TIME", "08:00")
+DEVOTION_PUBLISH_TIME = os.getenv("DEVOTION_PUBLISH_TIME", "06:00")
 CHAT_IDS = {int(x) for x in os.getenv("CHAT_IDS", "").split(",") if x.strip().isdigit()}
 try:
     WEBSITE_POLL_INTERVAL = min(60.0, max(2.0, float(os.getenv("WEBSITE_POLL_INTERVAL", "5"))))
@@ -1470,6 +1470,23 @@ def broadcast_group_update(bot, accid: int, site: SiteConfig, message: str) -> i
     return delivered
 
 
+def publish_daily_devotion(bot, accid: int, site: SiteConfig, message: str | None = None) -> int:
+    """发布当天灵修，并为成功送达的群记录当天已发布。"""
+    target_date = now(site).date().isoformat()
+    message = message or daily_devotion_text(site)
+    delivered = 0
+    for group_chat_id in sorted(site.chat_ids):
+        try:
+            send(bot, accid, group_chat_id, message)
+            with state_lock:
+                state["reminded"][f"{site.site_id}:{target_date}:devotion:{group_chat_id}"] = now(site).isoformat()
+                save_state()
+            delivered += 1
+        except Exception as error:
+            bot.logger.exception("发送每日灵修失败：site=%s chat_id=%s error=%s", site.site_id, group_chat_id, error)
+    return delivered
+
+
 def announce_change(
     bot,
     accid: int,
@@ -1753,8 +1770,7 @@ def handle_admin_command(
         if not site:
             send(bot, accid, chat_id, "请先选择要发布灵修的网站。")
             return True
-        message = daily_devotion_text(site)
-        delivered = broadcast_group_update(bot, accid, site, message)
+        delivered = publish_daily_devotion(bot, accid, site)
         if is_group and chat_id in site.chat_ids:
             send(bot, accid, chat_id, f"✅ 今日灵修已发布。")
         else:
