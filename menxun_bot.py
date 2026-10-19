@@ -1975,7 +1975,7 @@ def admin_help_text(super_admin: bool = False, group_admin: bool = False) -> str
             "管理员验证 密钥 — 验证为超级管理员",
             "",
             "小组管理员请联系超级管理员授权。",
-            "所有管理指令仅限私聊。",
+            "权限验证、授权和群绑定请在私聊操作。",
         ])
     lines = [f"{BOT_NAME} · {'超级管理员' if super_admin else '小组管理员'}", ""]
     if super_admin:
@@ -2003,7 +2003,7 @@ def admin_help_text(super_admin: bool = False, group_admin: bool = False) -> str
         "管理员 本周总结 / 历史总结 — 发布全组总结",
         "",
         "管理员状态 — 查看身份和管理范围",
-        "所有管理指令仅限私聊。",
+        "权限验证、授权和群绑定请在私聊操作；群内可发布灵修。",
     ])
     return "\n".join(lines)
 
