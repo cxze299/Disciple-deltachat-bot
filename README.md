@@ -1,5 +1,17 @@
 # 门训同行 Delta Chat Bot
 
+现已移植 Tato-menxunbot 的 Cedar、读经和全组统计功能。Delta 账号、联系人、通知群与原有网站配置继续独立保存。
+
+新增指令：`读经状态`、`我的读经记录`、`小组读经状态`、`本周总结`、`历史总结`。个人历史仍使用 `门训总结`。
+
+超级管理员可私聊发送 `管理员 绑定群` / `管理员 解绑群`，按编号选择群和 Cedar 小组后回复“确认”；`管理员 群列表` 会直接读取机器人所在的群。已有的 `管理员 绑定群 网站 群ID` 继续支持。
+
+`管理员 本周总结` / `管理员 历史总结` 可向当前站点群发送全组统计。`管理员 添加小组管理员 网站 用户ID` 和 `管理员 删除小组管理员 网站 用户ID` 管理小组权限，旧管理员自动兼容为超级管理员。
+
+Cedar 站点在 `sites.json` 配置 `url` 为 `https://your-site.example/api/bot/groups/小组代码`，并填写 `api_key`。群 ID 必须使用 Delta 的实际群 ID，不能复制其他聊天平台的 ID。
+
+读经查询优先使用网站独立读经记录；未启用时从私有数据目录的 `reading-plans.json` 按站点 ID 关联微读计划，凭证放入 `weidu-token.json`。未配置、过期或无权限时明确提示未知，不当成未读。配置与凭证不可提交到 Git。
+
 [![CI](https://github.com/cxze299/Disciple-deltachat-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/cxze299/Disciple-deltachat-bot/actions/workflows/ci.yml)
 
 面向 Delta Chat / Chatmail 的门训打卡机器人。支持多网站、多群提醒、私聊打卡、补签、取消打卡、状态查询和一次验证的管理员体系。

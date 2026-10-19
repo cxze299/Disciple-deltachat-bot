@@ -27,6 +27,7 @@ from deltachat2 import ChatType, MessageData, events
 from deltabot_cli import BotCli
 
 from admin_key import load_key_record, verify_key
+from delta_workflows import DeltaWorkflows
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("MENXUN_DATA_DIR", ROOT / "data"))
@@ -177,6 +178,7 @@ devotion_cache: dict[str, tuple[float, str]] = {}
 admin_attempt_lock = threading.Lock()
 admin_failed_attempts: dict[int, list[float]] = {}
 sites_lock = threading.Lock()
+workflows = {}
 
 
 @cli.on(events.RawEvent)
@@ -876,6 +878,8 @@ def help_text(site: SiteConfig | None = None) -> str:
         "我的月状态 — 查看个人本月月历",
         "门训总结 — 查看个人全部历史统计",
         "群状态 — 查看全群完成情况",
+        "本周总结 — 查看全组本周完成情况",
+        "历史总结 — 查看全组历史完成情况",
         "任务 — 查看今日和本周任务",
         "",
         "日期可填写：2026-08-20、昨天、前天",
@@ -1980,6 +1984,8 @@ def admin_help_text(super_admin: bool = False, group_admin: bool = False) -> str
             "管理员 网站状态 — 检查所有网站",
             "管理员 群列表 — 查看网站与群 ID",
             "管理员 绑定群 网站 群ID — 绑定通知群",
+            "管理员 绑定群 — 按提示选择 Cedar 小组和群聊",
+            "管理员 解绑群 — 按提示解除 Cedar 群绑定",
             "",
             "【权限管理】",
             "管理员 小组管理员列表 — 查看授权",
@@ -1994,6 +2000,7 @@ def admin_help_text(super_admin: bool = False, group_admin: bool = False) -> str
         "管理员 广播 内容 — 发送公告",
         "管理员 发布灵修 — 发布今日灵修",
         "管理员 立即提醒 早间/晚间 — 发送提醒",
+        "管理员 本周总结 / 历史总结 — 发布全组总结",
         "",
         "管理员状态 — 查看身份和管理范围",
         "所有管理指令仅限私聊。",
@@ -2375,6 +2382,12 @@ def on_new_message(bot, accid: int, event) -> None:
         if not text:
             return
         bot.logger.info("收到消息：chat_id=%s text=%r", chat_id, safe_log_text(raw_text))
+        if not is_group:
+            flow = workflows.get(accid)
+            if flow is None:
+                flow = workflows[accid] = DeltaWorkflows(sys.modules[__name__], bot, accid)
+            if flow.handle(chat_id, member_id, command_text):
+                return
         if handle_admin_command(bot, accid, chat_id, member_id, is_group, site, command_text):
             return
         if text in {"帮助", "菜单"}:
@@ -2479,7 +2492,7 @@ def on_new_message(bot, accid: int, event) -> None:
             except ValueError:
                 send(bot, accid, chat_id, "月份格式不正确。\n请发送“我的月状态”，或例如“我的月状态 2026-07”。")
             return
-        if text in {"门训总结", "进度总结", "历史总结", "我的总结"}:
+        if text in {"门训总结", "进度总结", "我的总结"}:
             name = bound_name(member_id, site)
             send(bot, accid, chat_id, member_history_summary(site, name) if name else f"请先绑定 {site.name} 的身份，例如：绑定 你的姓名")
             return
