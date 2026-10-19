@@ -18,7 +18,7 @@ COPY requirements.txt ./
 RUN python -m pip install --no-cache-dir --upgrade pip \
     && python -m pip install --no-cache-dir -r requirements.txt
 
-COPY menxun_bot.py admin_key.py set_admin_key.py healthcheck.py test_menxun_bot.py docker-entrypoint.sh sites.example.json ./
+COPY menxun_bot.py delta_workflows.py admin_key.py set_admin_key.py healthcheck.py test_menxun_bot.py docker-entrypoint.sh sites.example.json ./
 RUN chmod +x /app/docker-entrypoint.sh \
     && mkdir -p /config /data/account
 

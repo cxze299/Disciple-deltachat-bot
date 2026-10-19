@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import hashlib
+import errno
 import json
 import os
 import re
 import ssl
+import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import time
 import html as html_lib
 from calendar import monthrange
@@ -16,7 +19,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin
+from urllib.parse import quote, urljoin
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -24,12 +27,13 @@ from deltachat2 import ChatType, MessageData, events
 from deltabot_cli import BotCli
 
 from admin_key import load_key_record, verify_key
+from delta_workflows import DeltaWorkflows
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("MENXUN_DATA_DIR", ROOT / "data"))
 STATE_FILE = DATA_DIR / "state.json"
 HEALTH_FILE = DATA_DIR / "health.json"
-BOT_NAME = os.getenv("BOT_NAME", "门训同行")
+BOT_NAME = os.getenv("BOT_NAME", "门训同行").replace("香柏木门训", "门训")
 TIMEZONE = os.getenv("BOT_TIMEZONE", "Asia/Shanghai")
 WEBSITE_URL = os.getenv("MENXUN_WEBSITE_URL", "http://127.0.0.1:3000").rstrip("/")
 MORNING_REMINDER_TIME = os.getenv("MORNING_REMINDER_TIME", "08:30")
@@ -54,6 +58,10 @@ class SiteConfig:
     devotion_time: str = DEVOTION_PUBLISH_TIME
     morning_time: str = MORNING_REMINDER_TIME
     evening_time: str = EVENING_REMINDER_TIME
+    api_key: str = ""
+
+    def __post_init__(self):
+        object.__setattr__(self, "name", self.name.replace("香柏木门训", "门训"))
 
 
 def parse_chat_ids(value) -> frozenset[int]:
@@ -149,6 +157,7 @@ def load_sites() -> tuple[SiteConfig, ...]:
             devotion_time=devotion_time,
             morning_time=morning_time,
             evening_time=evening_time,
+            api_key=str(row.get("api_key") or row.get("apiKey") or "").strip(),
         ))
     if not sites:
         raise RuntimeError("没有启用任何门训网站。")
@@ -169,6 +178,7 @@ devotion_cache: dict[str, tuple[float, str]] = {}
 admin_attempt_lock = threading.Lock()
 admin_failed_attempts: dict[int, list[float]] = {}
 sites_lock = threading.Lock()
+workflows = {}
 
 
 @cli.on(events.RawEvent)
@@ -198,13 +208,23 @@ def load_state() -> dict:
     loaded.setdefault("bindings", {})
     loaded.setdefault("active_sites", {})
     loaded.setdefault("admins", {})
+    loaded.setdefault("super_admins", {})
+    loaded.setdefault("group_admins", {})
     loaded.setdefault("welcomed", {})
     loaded.setdefault("website_records", {})
     loaded.setdefault("recent_announcements", {})
     loaded.setdefault("warm_reminders", {})
     loaded.setdefault("member_join_dates", {})
+    loaded.setdefault("website_event_cursors", {})
+    loaded.setdefault("website_event_deliveries", {})
     if not isinstance(loaded["admins"], dict):
         loaded["admins"] = {}
+    if not isinstance(loaded["super_admins"], dict):
+        loaded["super_admins"] = {}
+    if not loaded["super_admins"]:
+        loaded["super_admins"] = dict(loaded["admins"])
+    if not isinstance(loaded["group_admins"], dict):
+        loaded["group_admins"] = {}
     if not isinstance(loaded["welcomed"], dict):
         loaded["welcomed"] = {}
     if not isinstance(loaded["website_records"], dict):
@@ -215,6 +235,10 @@ def load_state() -> dict:
         loaded["warm_reminders"] = {}
     if not isinstance(loaded["member_join_dates"], dict):
         loaded["member_join_dates"] = {}
+    if not isinstance(loaded["website_event_cursors"], dict):
+        loaded["website_event_cursors"] = {}
+    if not isinstance(loaded["website_event_deliveries"], dict):
+        loaded["website_event_deliveries"] = {}
     return loaded
 
 
@@ -240,19 +264,52 @@ def write_health(status: str = "running") -> None:
     temporary.replace(HEALTH_FILE)
 
 
-def is_admin(member_id: int) -> bool:
-    return str(member_id) in state["admins"]
+def is_super_admin(member_id: int) -> bool:
+    records = state.get("super_admins") or state.get("admins") or {}
+    return str(member_id) in records
+
+
+def group_admin_site_ids(member_id: int) -> set[str]:
+    member_key = str(member_id)
+    return {
+        site_id for site_id, records in (state.get("group_admins") or {}).items()
+        if isinstance(records, dict) and member_key in records
+    }
+
+
+def is_group_admin(member_id: int, site: SiteConfig | None = None) -> bool:
+    site_ids = group_admin_site_ids(member_id)
+    return bool(site_ids) if site is None else site.site_id in site_ids
+
+
+def is_admin(member_id: int, site: SiteConfig | None = None) -> bool:
+    return is_super_admin(member_id) or is_group_admin(member_id, site)
 
 
 def bind_admin(member_id: int) -> None:
     with state_lock:
-        state["admins"][str(member_id)] = {"verified_at": datetime.now().astimezone().isoformat()}
+        record = {"verified_at": datetime.now().astimezone().isoformat()}
+        state.setdefault("super_admins", {})[str(member_id)] = record
+        state.setdefault("admins", {})[str(member_id)] = record
         save_state()
 
 
 def unbind_admin(member_id: int) -> None:
     with state_lock:
+        state.setdefault("super_admins", {}).pop(str(member_id), None)
         state["admins"].pop(str(member_id), None)
+        save_state()
+
+
+def set_group_admin(member_id: int, site: SiteConfig, enabled: bool) -> None:
+    with state_lock:
+        records = state.setdefault("group_admins", {}).setdefault(site.site_id, {})
+        if enabled:
+            records[str(member_id)] = {"assigned_at": datetime.now().astimezone().isoformat()}
+        else:
+            records.pop(str(member_id), None)
+            if not records:
+                state["group_admins"].pop(site.site_id, None)
         save_state()
 
 
@@ -283,12 +340,16 @@ def safe_log_text(raw_text: str) -> str:
 
 
 def send(bot, accid: int, chat_id: int, text: str) -> None:
-    if "**" not in text:
+    reader_links = list(re.finditer(r"\[([^\]\n]+)\]\((https://[^\s)]+\?reader_source=[^\s)]+)\)", text))
+    if "**" not in text and not reader_links:
         bot.rpc.send_msg(accid, chat_id, MessageData(text=text))
         return
     plain_text = text.replace("**", "")
     escaped = html_lib.escape(text)
     formatted = re.sub(r"\*\*([\s\S]*?)\*\*", r"<strong>\1</strong>", escaped)
+    for link in reader_links:
+        anchor = f'<a href="{html_lib.escape(link.group(2), quote=True)}">{html_lib.escape(link.group(1))}</a>'
+        formatted = formatted.replace(html_lib.escape(link.group(0)), anchor)
     html = "<div>" + formatted.replace("\n", "<br>") + "</div>"
     bot.rpc.send_msg(accid, chat_id, MessageData(text=plain_text, html=html))
 
@@ -321,18 +382,30 @@ def send_private_welcome_once(bot, accid: int, chat_id: int, member_id: int, is_
     return True
 
 
-def fetch_json(site: SiteConfig, path: str) -> dict:
+def site_request_url(site: SiteConfig, path: str) -> str:
+    """兼容普通网站根地址和按学习小组暴露的 Bot API 根地址。"""
+    clean_path = str(path or "")
+    if "/api/bot/groups/" in site.url and clean_path.startswith("/api/"):
+        clean_path = clean_path[4:]
+    return f"{site.url}{clean_path}"
+
+
+def fetch_json(site: SiteConfig, path: str, retries: int = 4) -> dict:
     """读取 NAS API；对 Synology 反向代理偶发的 TLS EOF 做有限重试。"""
-    url = f"{site.url}{path}"
+    url = site_request_url(site, path)
     last_error: Exception | None = None
-    for attempt in range(4):
-        request = Request(
-            url,
-            headers={
+    retries = min(4, max(1, retries))
+    for attempt in range(retries):
+        headers = {
                 "Accept": "application/json",
                 "Connection": "close",
                 "User-Agent": "MenxunDeltaChatBot/1.0",
-            },
+            }
+        if site.api_key:
+            headers["Authorization"] = f"Bearer {site.api_key}"
+        request = Request(
+            url,
+            headers=headers,
         )
         try:
             with urlopen(request, timeout=12) as response:
@@ -341,25 +414,28 @@ def fetch_json(site: SiteConfig, path: str) -> dict:
             raise
         except (URLError, TimeoutError, ssl.SSLError, ConnectionError, json.JSONDecodeError) as error:
             last_error = error
-            if attempt == 3:
+            if attempt == retries - 1:
                 break
             time.sleep(0.5 * (2 ** attempt))
-    raise RuntimeError(f"读取门训网站失败（已重试 4 次）：{url}；{last_error}") from last_error
+    raise RuntimeError(f"读取门训网站失败（已尝试 {retries} 次）：{url}；{last_error}") from last_error
 
 
 def fetch_text(site: SiteConfig, path: str) -> str:
-    url = urljoin(f"{site.url}/", str(path or "").lstrip("./"))
+    url = site_request_url(site, path) if "/api/bot/groups/" in site.url else urljoin(f"{site.url}/", str(path or "").lstrip("./"))
     with config_cache_lock:
         cached = devotion_cache.get(url)
         if cached and time.monotonic() - cached[0] < 3600:
             return cached[1]
     last_error: Exception | None = None
     for attempt in range(4):
-        request = Request(url, headers={
+        headers = {
             "Accept": "text/markdown,text/plain,*/*",
             "Connection": "close",
             "User-Agent": "MenxunDeltaChatBot/1.0",
-        })
+        }
+        if site.api_key:
+            headers["Authorization"] = f"Bearer {site.api_key}"
+        request = Request(url, headers=headers)
         try:
             with urlopen(request, timeout=15) as response:
                 text = response.read().decode("utf-8-sig", errors="replace")
@@ -378,16 +454,19 @@ def fetch_text(site: SiteConfig, path: str) -> str:
 
 def post_json(site: SiteConfig, path: str, payload: dict) -> dict:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    request = Request(
-        f"{site.url}{path}",
-        data=body,
-        method="POST",
-        headers={
+    headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
             "Connection": "close",
             "User-Agent": "MenxunDeltaChatBot/1.0",
-        },
+        }
+    if site.api_key:
+        headers["Authorization"] = f"Bearer {site.api_key}"
+    request = Request(
+        site_request_url(site, path),
+        data=body,
+        method="POST",
+        headers=headers,
     )
     with urlopen(request, timeout=12) as response:
         return json.loads(response.read().decode("utf-8"))
@@ -395,13 +474,16 @@ def post_json(site: SiteConfig, path: str, payload: dict) -> dict:
 
 def delete_json(site: SiteConfig, path: str) -> dict:
     """DELETE 可安全重试；若首次请求已成功但连接中断，重试得到 404 也视为已删除。"""
-    url = f"{site.url}{path}"
+    url = site_request_url(site, path)
     last_error: Exception | None = None
     for attempt in range(4):
+        headers = {"Accept": "application/json", "Connection": "close", "User-Agent": "MenxunDeltaChatBot/1.0"}
+        if site.api_key:
+            headers["Authorization"] = f"Bearer {site.api_key}"
         request = Request(
             url,
             method="DELETE",
-            headers={"Accept": "application/json", "Connection": "close", "User-Agent": "MenxunDeltaChatBot/1.0"},
+            headers=headers,
         )
         try:
             with urlopen(request, timeout=12) as response:
@@ -418,22 +500,25 @@ def delete_json(site: SiteConfig, path: str) -> dict:
     raise RuntimeError(f"取消门训打卡失败（已重试 4 次）：{url}；{last_error}") from last_error
 
 
-def website_config(site: SiteConfig) -> dict:
+def website_config(site: SiteConfig, retries: int = 4) -> dict:
     """配置缓存 60 秒，减少 NAS TLS 连接次数；状态数据始终实时读取。"""
     current_time = time.monotonic()
     with config_cache_lock:
         cached = config_cache.get(site.site_id)
         if cached and current_time - cached[0] < 60:
             return cached[1]
-    config = fetch_json(site, "/api/config")
+    config = fetch_json(site, "/api/config", retries=retries)
+    # 部分新版站点返回 {"ok": true, "config": {...}}，统一解包为配置对象。
+    if isinstance(config.get("config"), dict):
+        config = config["config"]
     with config_cache_lock:
         config_cache[site.site_id] = (current_time, config)
     return config
 
 
-def website_snapshot(site: SiteConfig) -> tuple[dict, dict]:
+def website_snapshot(site: SiteConfig, retries: int = 4) -> tuple[dict, dict]:
     """读取指定网站当前成员、周计划、任务配置和打卡记录。"""
-    return fetch_json(site, "/api/state"), website_config(site)
+    return fetch_json(site, "/api/state", retries=retries), website_config(site, retries=retries)
 
 
 def format_title(value) -> str:
@@ -595,6 +680,10 @@ def clean_devotion_markdown(lines: list[str]) -> str:
 
 
 def extract_devotion_section(markdown: str, devotion: dict, target_date: date) -> str:
+    markdown = re.sub(
+        r'([。！？!?」”])[ \t]*((?:[0-9一二三四五六七八九十]+)月(?:[0-9一二三四五六七八九十廿卅]+)日)(?=[「“])',
+        r'\1\n\n\2\n\n', markdown,
+    )
     lines = markdown.splitlines()
     source_path = str(devotion.get("path") or devotion.get("url") or "")
     mode = str(devotion.get("mode") or "").strip().lower()
@@ -625,31 +714,40 @@ def extract_devotion_section(markdown: str, devotion: dict, target_date: date) -
 
     month = target_date.month
     day = target_date.day
-    targets = {
-        f"{month}月{day}日",
-        f"{chinese_calendar_number(month)}月{chinese_calendar_number(day)}日",
-    }
     date_heading = re.compile(
-        r"^(?:#{1,6}\s*)?(?:\d{1,2}|[一二三四五六七八九十]{1,3})\s*月\s*"
-        r"(?:\d{1,2}|[一二三四五六七八九十]{1,3})\s*日"
+        r"^(?:#{1,6}\s*)?(\d{1,2}|[一二三四五六七八九十]{1,3})\s*月\s*"
+        r"(\d{1,2}|[一二三四五六七八九十廿卅]{1,3})\s*(?:日|号)"
     )
+    def calendar_number(value: str) -> int:
+        if value.isdigit():
+            return int(value)
+        value = value.replace('廿', '二十').replace('卅', '三十')
+        digits = '零一二三四五六七八九'
+        if '十' in value:
+            tens, ones = value.split('十', 1)
+            return (digits.index(tens) if tens else 1) * 10 + (digits.index(ones) if ones else 0)
+        return digits.index(value)
+
     captured = []
     active = False
     for raw_line in lines:
         line = raw_line.strip()
         normalized = re.sub(r"^#{1,6}\s*", "", line)
+        heading = date_heading.match(line)
+        heading_date = None
+        if heading and len(normalized) < 100:
+            try:
+                heading_date = (calendar_number(heading[1]), calendar_number(heading[2]))
+            except ValueError:
+                pass
         if not active:
-            if any(normalized.startswith(target) for target in targets) and len(normalized) < 100:
+            if heading_date == (month, day):
                 active = True
-                suffix = normalized
-                for target in targets:
-                    if suffix.startswith(target):
-                        suffix = suffix[len(target):].lstrip(" -|:：")
-                        break
+                suffix = line[heading.end():].lstrip(" -|:：")
                 if suffix:
                     captured.append(suffix)
             continue
-        if date_heading.match(line) and not any(normalized.startswith(target) for target in targets):
+        if heading_date is not None and heading_date != (month, day):
             break
         captured.append(raw_line)
     return clean_devotion_markdown(captured)
@@ -660,13 +758,59 @@ def daily_devotion_text(site: SiteConfig, target_date: date | None = None) -> st
     _, config = website_snapshot(site)
     daily = ((config.get("task_sections") or {}).get("daily") or {})
     devotion = daily.get("devotion") or daily
-    source_path = devotion.get("path") or devotion.get("url") or daily.get("path") or daily.get("url")
-    title = str(devotion.get("title") or daily.get("label") or "每日灵修").strip()
+    cedar = is_cedar_site(site)
+    plan = None
+    if cedar and devotion.get("enabled") is False:
+        raise RuntimeError(f"{site.name} 今日灵修已停用，未发送通知。")
+    if cedar and str(devotion.get("plan_mode") or "").lower() == "custom":
+        plan = next((item for item in devotion.get("plans") or []
+                     if isinstance(item, dict) and str(item.get("date")) == target_date.isoformat()), None)
+        if plan is None:
+            raise RuntimeError(f"{site.name} {target_date.isoformat()} 没有灵修计划，未发送通知。")
+    plan = plan or {}
+    source_path = (plan.get("path") or devotion.get("custom_path") or devotion.get("path")
+                   or devotion.get("url") or daily.get("path") or daily.get("url"))
+    title = str(plan.get("title") or devotion.get("title") or daily.get("label") or "每日灵修").strip()
     if not source_path:
+        if cedar:
+            raise RuntimeError(f"{site.name} 未配置灵修资源，未发送通知。")
         return f"📖 {site.name} · {target_date.isoformat()}\n该网站暂未配置可读取的灵修内容。"
+    if cedar and (str(plan.get("type") or devotion.get("type") or "").lower() == "pdf"
+                  or str(source_path).lower().endswith(".pdf")):
+        start = str(plan.get("page_start") or "").strip()
+        end = str(plan.get("page_end") or start).strip()
+        if not start and str(devotion.get("start_page") or "").isdigit():
+            try:
+                offset = (target_date - date.fromisoformat(str(devotion.get("numbered_start_date")))).days
+                start = str(int(devotion["start_page"]) + offset)
+                end = start
+            except (TypeError, ValueError):
+                pass
+        pages = f"{start}-{end}" if start.isdigit() and end.isdigit() else ""
+        site_root = site.url.split("/api/bot/groups/", 1)[0]
+        asset = re.fullmatch(r"/api/assets/(\d+)/download", str(source_path).strip())
+        if pages and asset:
+            reader_source = f"/api/assets/{asset.group(1)}/range?pages={pages}"
+            link = (f"{site_root}/?reader_source={quote(reader_source, safe='')}"
+                    f"&reader_title={quote(title, safe='')}&reader_pages={quote(pages, safe='')}")
+        else:
+            link = site_root
+        page_label = f"第 {start}–{end} 页" if pages else "今日安排的页码"
+        group_code = str((config.get("site_info") or {}).get("group_code") or "").strip()
+        if pages and asset:
+            if group_code:
+                link += f"&reader_group={quote(group_code, safe='')}"
+            return f"📖 {site.name} · {target_date.isoformat()}\n[{title}]({link})\n\n阅读 PDF {page_label}（点击标题打开）"
+        return f"📖 {site.name} · {target_date.isoformat()}\n{title}\n\n阅读 PDF {page_label}：\n{link}\n（登录 Cedar 网站后可打开）"
     markdown = fetch_text(site, str(source_path))
-    content = extract_devotion_section(markdown, devotion, target_date)
+    section_config = {**devotion, "path": source_path}
+    if cedar and str(plan.get("section") or "").isdigit():
+        section_config.update({"mode": "numbered", "numbered_start_date": target_date.isoformat(),
+                               "numbered_start": int(plan["section"])})
+    content = extract_devotion_section(markdown, section_config, target_date)
     if not content:
+        if cedar:
+            raise RuntimeError(f"{site.name} {target_date.isoformat()} 灵修资源中没有找到当天内容，未发送通知。")
         return f"📖 {site.name} · {target_date.isoformat()}\n没有找到当天的灵修内容。"
     return f"📖 {site.name} · {target_date.isoformat()}\n{title}\n\n{content}"
 
@@ -718,6 +862,9 @@ def help_text(site: SiteConfig | None = None) -> str:
     lines.extend([
         "日常打卡",
         "灵修 — 阅读当天灵修内容",
+        "读经状态、我的读经状态 — 查看个人今日及近 7 天读经情况",
+        "我的读经记录 — 查看个人最近 30 天读经记录",
+        "小组读经状态、群读经状态 — 查看今日已读、未读名单",
         "打卡 灵修",
         "打卡 周读物",
         "打卡 视频",
@@ -731,6 +878,8 @@ def help_text(site: SiteConfig | None = None) -> str:
         "我的月状态 — 查看个人本月月历",
         "门训总结 — 查看个人全部历史统计",
         "群状态 — 查看全群完成情况",
+        "本周总结 — 查看全组本周完成情况",
+        "历史总结 — 查看全组历史完成情况",
         "任务 — 查看今日和本周任务",
         "",
         "日期可填写：2026-08-20、昨天、前天",
@@ -851,7 +1000,7 @@ def site_list_text(member_id: int = 0) -> str:
     lines.extend([
         "",
         "请直接回复上面的网站名称。",
-        "例如：科大",
+        "例如：科大门训",
         "",
         "选择后，机器人会告诉你下一步怎么做。",
     ])
@@ -860,11 +1009,11 @@ def site_list_text(member_id: int = 0) -> str:
 
 def site_choice_name(site: SiteConfig) -> str:
     return {
-        "zk": "科大",
+        "zk": "科大（旧网站）",
         "agape": "Agape",
-        "zhewai": "浙外",
+        "zhewai": "浙外特教",
         "longway": "Longway",
-        "tianlu": "天路历程",
+        "tianlu": "浙外万向",
     }.get(site.site_id, site.name)
 
 
@@ -872,18 +1021,49 @@ def find_site(value: str) -> SiteConfig | None:
     clean = value.strip().lower()
     alias_id = {
         "科大": "zk",
-        "科大门训": "zk",
+        "科大门训": "cedar-zk",
         "agape": "agape",
         "浙外": "zhewai",
         "浙外门训": "zhewai",
+        "浙外特教": "zhewai",
+        "在浙外特教": "zhewai",
+        "特教": "zhewai",
         "longway": "longway",
         "天路": "tianlu",
         "天路历程": "tianlu",
+        "浙外万向": "tianlu",
+        "万向": "tianlu",
     }.get(clean)
-    return SITE_BY_ID.get(clean) or SITE_BY_ID.get(alias_id or "") or next(
-        (site for site in SITES if site.name.lower() == clean),
-        None,
+    direct = SITE_BY_ID.get(clean) or SITE_BY_ID.get(alias_id or "") or next(
+        (site for site in SITES if site.name.lower() == clean), None
     )
+    if direct:
+        return direct
+    # 多小组网站允许使用斜杠后的组名，例如“YDS_HZ灵命组”，无需输入整段显示名。
+    suffix_matches = [
+        site for site in SITES
+        if site.name.rsplit("/", 1)[-1].strip().lower() == clean
+    ]
+    return suffix_matches[0] if len(suffix_matches) == 1 else None
+
+
+def admin_bind_group_guide() -> str:
+    lines = [
+        "🧭 绑定通知群（请在私聊中操作）",
+        "",
+        "第 1 步：从“管理员 群列表”找到未绑定的群 ID。",
+        "第 2 步：复制下面对应小组的指令，把末尾替换为群 ID：",
+    ]
+    lines.extend(
+        f"· 管理员 绑定群 {site.site_id} 群ID  （{site.name}）"
+        for site in SITES
+    )
+    lines.extend([
+        "",
+        "例如：管理员 绑定群 cedar-group-652872b0 85001808",
+        "也支持小组简称：管理员 绑定群 YDS_HZ灵命组 85001808",
+    ])
+    return "\n".join(lines)
 
 
 def parse_binding(text: str, current_site: SiteConfig | None) -> tuple[SiteConfig | None, str]:
@@ -921,8 +1101,6 @@ def kind_from_text(text: str) -> tuple[str, str]:
 TASK_KINDS = {
     "灵修": "每日灵修",
     "每日灵修": "每日灵修",
-    "读经": "每日灵修",
-    "灵修读经": "每日灵修",
     "周读物": "周读物",
     "读物": "周读物",
     "视频": "周视频",
@@ -1042,7 +1220,7 @@ def website_status(site: SiteConfig, name: str = "") -> str:
     weekly_schedule = website_state.get("weeklySchedule") or config.get("weekly_schedule") or []
     records = website_state.get("records") or []
     if name:
-        values = {"daily": "灵修/读经", "book": "周读物", "video": "视频", "verse": "背经"}
+        values = {"daily": "灵修", "book": "周读物", "video": "视频", "verse": "背经"}
         mine = []
         types = {"daily": "每日灵修", "book": "周读物", "video": "周视频", "verse": "周背经"}
         for column, label in values.items():
@@ -1051,7 +1229,7 @@ def website_status(site: SiteConfig, name: str = "") -> str:
             mine.append(f"✅ {label}" if done else f"⬜ {label}")
         return f"🙋 {site.name} / {name}\n" + "\n".join(mine)
     types = {
-        "daily": ("灵修/读经", "每日灵修"),
+        "daily": ("灵修", "每日灵修"),
         "book": ("周读物", "周读物"),
         "video": ("视频", "周视频"),
         "verse": ("背经", "周背经"),
@@ -1073,6 +1251,123 @@ def website_status(site: SiteConfig, name: str = "") -> str:
     for column, (label, _) in types.items():
         names = ordered_names(completed[column])
         lines.extend([f"\n{label}（{len(names)} 人）", "、".join(names) if names else "暂无"])
+    return "\n".join(lines)
+
+
+def reading_plan_binding(site: SiteConfig) -> dict:
+    path = DATA_DIR / "reading-plans.json"
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8-sig")).get(site.site_id) or {}
+
+
+def weidu_report(site: SiteConfig, binding: dict, days: int) -> dict[date, dict[str, bool] | None]:
+    """从微读日期列表取得真实 dayId，再读取有权限的小组日报。"""
+    token_file = DATA_DIR / "weidu-token.json"
+    if not token_file.exists():
+        raise PermissionError("微读访问凭证未配置")
+    token = str(json.loads(token_file.read_text(encoding="utf-8-sig")).get("x_ws_token") or "").strip()
+    if not token:
+        raise PermissionError("微读访问凭证未配置")
+    plan_id = str(binding.get("plan_id") or "")
+    if not re.fullmatch(r"[0-9a-fA-F-]{36}", plan_id):
+        raise ValueError("微读计划 ID 无效")
+    base = "https://oqu0hxcye.xiaoen.app/v2/groupplan/report/"
+    headers = {"Accept": "application/json", "X-WS-Token": token}
+    def get_report(path):
+        with urlopen(Request(base + path, headers=headers), timeout=12) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        if payload.get("errno") != 200:
+            raise PermissionError("微读访问凭证已失效或无权查看该计划")
+        return payload.get("data")
+    # 微读的 dayId 不能由日期推算；按 API 返回的 dayTime 对齐北京时间。
+    rows = get_report("list/" + quote(plan_id, safe="") + "?interval=" + str(days))
+    if not isinstance(rows, list):
+        raise ValueError("微读日期列表格式无效")
+    day_ids = {}
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        try:
+            day = datetime.fromtimestamp(int(item["dayTime"]), ZoneInfo("Asia/Shanghai")).date()
+            day_ids[day] = int(item["dayId"])
+        except (KeyError, TypeError, ValueError, OSError):
+            continue
+    result = {}
+    for day, day_id in day_ids.items():
+        data = get_report("daily/" + quote(plan_id, safe="") + "?dayId=" + str(day_id))
+        if not isinstance(data, dict) or not isinstance(data.get("done"), list) or not isinstance(data.get("undone"), list):
+            result[day] = None
+            continue
+        members = {}
+        for field, done in (("undone", False), ("done", True)):
+            for item in data[field]:
+                nickname = str(item.get("nickname") or "").strip() if isinstance(item, dict) else ""
+                if not nickname or nickname in members:
+                    continue
+                members[nickname] = done
+        result[day] = members
+    return result
+
+
+def scripture_record_done(record: dict) -> bool:
+    task_type = record.get("task_type")
+    if task_type:
+        return task_type == "daily_scripture"
+    return any(is_done_value(record.get(key)) for key in ("scripture", "daily_scripture", "每日读经"))
+
+
+def reading_status(site: SiteConfig, name: str = "", days: int = 7) -> str:
+    """优先独立读经打卡；未启用时使用当前小组关联的微读计划。"""
+    website_state, config = website_snapshot(site)
+    today = now(site).date()
+    records = website_state.get("records") or []
+    scripture_config = ((config.get("task_sections") or {}).get("daily") or {}).get("scripture") or {}
+    website_reading = bool(scripture_config) and scripture_config.get("enabled") is not False
+    title = f"{name} · 我的读经{'记录' if days == 30 else '状态'}" if name else "小组读经状态"
+    lines = [f"📖 {site.name} · {title}", f"日期：{today.isoformat()}"]
+    if website_reading:
+        lines.append("数据来源：网站独立读经打卡（每日读经）")
+        def completed(member, day):
+            return any(record_name(r) == member and record_logical_date(r, site) == day.isoformat()
+                       and scripture_record_done(r) for r in records)
+    else:
+        binding = reading_plan_binding(site)
+        lines.append("数据来源：微读圣经小组计划（网站未启用读经打卡）")
+        if not binding.get("plan_id"):
+            return "\n".join(lines + ["尚未关联本小组的微读读经计划，请提供小组名称和计划分享链接后关联。"])
+        try:
+            reports = weidu_report(site, binding, days if name else 1)
+        except PermissionError as error:
+            return "\n".join(lines + [f"⚠️ {error}。请配置机器人专用的微读访问凭证后重试。"])
+        except (ValueError, KeyError, TypeError, URLError, TimeoutError, OSError, json.JSONDecodeError):
+            return "\n".join(lines + ["⚠️ 微读报告暂时无法查询，请稍后重试。"])
+        def completed(member, day):
+            report = reports.get(day)
+            nickname = (binding.get("member_names") or {}).get(member, member)
+            return report.get(nickname) if report is not None else None
+
+    if name:
+        done = completed(name, today)
+        lines.append(f"今日打卡：{'⚠️ 暂时无法查询或未匹配计划成员' if done is None else '✅ 已打卡' if done else '⬜ 未打卡'}")
+        dates = [today - timedelta(days=offset) for offset in range(days)]
+        statuses = [(day, completed(name, day)) for day in dates]
+        lines.append(f"最近 {days} 天：已打卡 {sum(done is True for _, done in statuses)} 天")
+        lines.extend(f"{day.isoformat()} {'⚠️ 无法查询或未关联' if done is None else '✅ 已打卡' if done else '⬜ 无打卡记录'}" for day, done in statuses)
+    else:
+        members = list(dict.fromkeys(str(m).strip() for m in website_state.get("members") or [] if str(m).strip()))
+        statuses = {member: completed(member, today) for member in members}
+        done_names = [member for member in members if statuses[member] is True]
+        pending = [member for member in members if statuses[member] is False]
+        unknown = [member for member in members if statuses[member] is None]
+        lines.append(f"今日完成：{len(done_names)}/{len(members)} 人")
+        lines.extend([f"✅ 已读（{len(done_names)} 人）：" + ("、".join(done_names) or "暂无"),
+                      f"⬜ 未读（{len(pending)} 人）：" + ("、".join(pending) or "暂无")])
+        if unknown:
+            lines.append(f"⚠️ 状态未知（{len(unknown)} 人）：" + "、".join(unknown))
+        if not members:
+            lines.append("当前小组暂无成员名单。")
+    lines.append("读经与灵修分别统计；无记录或状态未知不代表未实际阅读。")
     return "\n".join(lines)
 
 
@@ -1135,10 +1430,16 @@ def member_month_status(
     ])
 
 
-def member_history_summary(site: SiteConfig, name: str, today: date | None = None) -> str:
+def member_history_summary(
+    site: SiteConfig,
+    name: str,
+    today: date | None = None,
+    start_date: date | None = None,
+    snapshot: tuple[dict, dict] | None = None,
+) -> str:
     """按加入日期和网站历史任务配置统计成员进度。"""
     current_day = today or now(site).date()
-    website_state, config = website_snapshot(site)
+    website_state, config = snapshot if snapshot is not None else website_snapshot(site)
     weekly_schedule = website_state.get("weeklySchedule") or config.get("weekly_schedule") or []
     records = [record for record in (website_state.get("records") or []) if isinstance(record, dict) and record_name(record) == name.strip()]
     labels = {
@@ -1161,13 +1462,16 @@ def member_history_summary(site: SiteConfig, name: str, today: date | None = Non
             continue
         parsed_records.append((record, logical_day))
 
-    configured_start = str(state.get("member_join_dates", {}).get(f"{site.site_id}:{name}", ""))
-    try:
-        join_day = date.fromisoformat(configured_start)
-    except ValueError:
-        normal_days = [day for record, day in parsed_records if not record_is_retro(record)]
-        all_days = [day for _, day in parsed_records]
-        join_day = min(normal_days or all_days) if all_days else current_day
+    if start_date is not None:
+        join_day = start_date
+    else:
+        configured_start = str(state.get("member_join_dates", {}).get(f"{site.site_id}:{name}", ""))
+        try:
+            join_day = date.fromisoformat(configured_start)
+        except ValueError:
+            normal_days = [day for record, day in parsed_records if not record_is_retro(record)]
+            all_days = [day for _, day in parsed_records]
+            join_day = min(normal_days or all_days) if all_days else current_day
     join_day = min(max(join_day, date(2000, 1, 1)), current_day)
 
     required_ids: dict[str, set[str]] = {task: set() for task in labels}
@@ -1294,6 +1598,66 @@ def checkin_timeline(
     return title, rows
 
 
+def bot_api_checkin_timeline(
+    site: SiteConfig, label: str, logical_date: str, task_type: str,
+    task_id: int = 0, week_id: int = 0,
+    excluded_names: frozenset[str] = frozenset(),
+) -> tuple[str, list[str]]:
+    """Use the same time-ordered group list for every 7399 task type."""
+    website_state, config = website_snapshot(site)
+    schedule = website_state.get("weeklySchedule") or config.get("weekly_schedule") or []
+    target_plan = current_week(schedule, date.fromisoformat(logical_date))
+    first_by_name: dict[str, tuple[float, datetime | None]] = {}
+    daily = task_type.startswith("daily_")
+    for record in website_state.get("records") or []:
+        name = record_name(record)
+        if not name or name in excluded_names or record.get("task_type") != task_type:
+            continue
+        if task_id and int(record.get("task_id") or 0) != task_id:
+            continue
+        if daily:
+            if record_logical_date(record, site) != logical_date:
+                continue
+        elif week_id:
+            if int(record.get("week_id") or 0) != week_id:
+                continue
+        elif not target_plan or not (str(target_plan["start"]) <= record_logical_date(record, site) <= str(target_plan["end"])):
+            continue
+        value = record_datetime(record, site)
+        sort_value = value.timestamp() if value else float("inf")
+        if name not in first_by_name or sort_value < first_by_name[name][0]:
+            first_by_name[name] = (sort_value, value)
+    ordered = sorted(first_by_name.items(), key=lambda item: (item[1][0], item[0]))
+    title = f"{logical_date} · {label}（按时间）" if daily else f"本周 · {label}（按时间）"
+    rows = []
+    for index, (name, (_, value)) in enumerate(ordered, 1):
+        time_text = value.strftime("%H:%M" if daily else "%m-%d %H:%M") if value else "时间未知"
+        rows.append(f"{index}. {time_text}  {name}")
+    return title, rows
+
+
+def checkin_icon(checkin_type: str, task_type: str = "") -> str:
+    by_task = {
+        "daily_devotion": "🙏",
+        "daily_scripture": "📖",
+        "weekly_book": "📚",
+        "weekly_video": "🎬",
+        "weekly_verse": "🧠",
+        "weekly_outline": "📝",
+    }
+    if task_type in by_task:
+        return by_task[task_type]
+    by_label = {
+        "每日灵修": "🙏", "灵修": "🙏",
+        "每日读经": "📖", "读经": "📖",
+        "周读物": "📚", "读物": "📚",
+        "周视频": "🎬", "视频": "🎬",
+        "周背经": "🧠", "背经": "🧠",
+        "提纲背诵": "📝",
+    }
+    return by_label.get(checkin_type, "📌")
+
+
 def build_group_update(
     site: SiteConfig,
     name: str,
@@ -1303,26 +1667,43 @@ def build_group_update(
     retro: bool = False,
     operation_time: str = "",
     event_time: str = "",
+    task_type: str = "",
+    task_id: int = 0,
+    week_id: int = 0,
 ) -> str:
-    display_type = {"每日灵修": "灵修", "周读物": "周读物", "周视频": "视频", "周背经": "背经"}[checkin_type]
+    legacy_types = {"每日灵修": "灵修", "周读物": "周读物", "周视频": "视频", "周背经": "背经"}
+    display_type = legacy_types.get(checkin_type, checkin_type)
     if cancelled:
         headline = f"↩️ {name}取消了打卡：{display_type}"
     else:
-        headline = f"✅ {name}打卡了：{display_type}"
+        headline = f"{checkin_icon(checkin_type, task_type)} {name}打卡了：{display_type}"
     if retro:
         headline += f"（补签 {logical_date}）"
     if operation_time:
         headline += f"\n操作时间：{operation_time}"
     try:
-        title, rows = checkin_timeline(
-            site,
-            checkin_type,
-            logical_date,
-            frozenset({name}) if cancelled else frozenset(),
-        )
+        if "/api/bot/groups/" in site.url and task_type:
+            title, rows = bot_api_checkin_timeline(
+                site, display_type, logical_date, task_type, task_id, week_id,
+            )
+        elif checkin_type in legacy_types:
+            title, rows = checkin_timeline(
+                site, checkin_type, logical_date,
+                frozenset({name}) if cancelled else frozenset(),
+            )
+        else:
+            raise ValueError("task timeline unavailable")
     except Exception:
+        if "/api/bot/groups/" in site.url and task_type:
+            raise
+        if checkin_type not in legacy_types and not cancelled:
+            fallback_time = event_time or now(site).strftime("%m-%d %H:%M")
+            scope = logical_date if task_type.startswith("daily_") else "本周"
+            return headline + f"\n\n{scope} · 本次记录\n1. {fallback_time}  {name}"
         return headline + "\n名单暂时无法读取，请发送“群状态”重试。"
     if not rows and not cancelled:
+        if "/api/bot/groups/" in site.url and task_type:
+            raise RuntimeError(f"网站打卡名单尚未包含本次记录：site={site.site_id} task={task_type}")
         fallback_time = event_time or now(site).strftime("%m-%d %H:%M")
         return headline + f"\n\n本次记录\n1. {fallback_time}  {name}"
     return headline + f"\n\n{title}\n" + ("\n".join(rows) if rows else "暂无打卡")
@@ -1383,6 +1764,8 @@ def remember_announced_change(
 
 def poll_website_notifications(bot, accid: int, site: SiteConfig) -> int:
     """检测网站新增和删除记录；首次运行仅建立基线。"""
+    if "/api/bot/groups/" in site.url:
+        return poll_bot_api_events(bot, accid, site)
     website_state, _ = website_snapshot(site)
     records = [record for record in (website_state.get("records") or []) if isinstance(record, dict)]
     current = {record_fingerprint(record): record for record in records}
@@ -1421,7 +1804,9 @@ def poll_website_notifications(bot, accid: int, site: SiteConfig) -> int:
                 retro=bool(summary.get("retro")),
                 operation_time=operation_time,
             )
-            broadcast_group_update(bot, accid, site, message)
+            delivery_key = f"{site.site_id}:cancel:{fingerprint}:{checkin_type}"
+            if broadcast_group_update(bot, accid, site, message, delivery_key) < len(site.chat_ids):
+                raise RuntimeError(f"网站取消打卡通知未全部送达：site={site.site_id}")
             delivered_events += 1
 
     fallback_time = datetime.min.replace(tzinfo=ZoneInfo(site.timezone))
@@ -1445,11 +1830,17 @@ def poll_website_notifications(bot, accid: int, site: SiteConfig) -> int:
                 retro=record_is_retro(record),
                 event_time=(record_datetime(record, site) or now(site)).strftime("%m-%d %H:%M"),
             )
-            broadcast_group_update(bot, accid, site, message)
+            delivery_key = f"{site.site_id}:checkin:{record_fingerprint(record)}:{checkin_type}"
+            if broadcast_group_update(bot, accid, site, message, delivery_key) < len(site.chat_ids):
+                raise RuntimeError(f"网站打卡通知未全部送达：site={site.site_id}")
             delivered_events += 1
 
     with state_lock:
         state["website_records"][site.site_id] = current_compact
+        state["website_event_deliveries"] = {
+            key: value for key, value in state["website_event_deliveries"].items()
+            if not key.startswith(f"{site.site_id}:")
+        }
         cutoff = time.time() - 600
         state["recent_announcements"] = {
             key: value for key, value in state["recent_announcements"].items()
@@ -1459,12 +1850,76 @@ def poll_website_notifications(bot, accid: int, site: SiteConfig) -> int:
     return delivered_events
 
 
-def broadcast_group_update(bot, accid: int, site: SiteConfig, message: str) -> int:
+def poll_bot_api_events(bot, accid: int, site: SiteConfig) -> int:
+    """读取香柏木 Bot API 增量事件，避免反复下载全部历史记录。"""
+    cursor = str(state["website_event_cursors"].get(site.site_id) or "")
+    path = "/api/events" + (f"?cursor={quote(cursor, safe='')}" if cursor else "")
+    payload = fetch_json(site, path)
+    events = payload.get("events") or []
+    delivered = 0
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        name = str(event.get("name") or "").strip()
+        checkin_type = str(event.get("type") or "").strip()
+        task_type = str(event.get("task_type") or "").strip()
+        logical_date = str(event.get("logical_date") or "").strip()
+        action = str(event.get("action") or "checkin")
+        if not name or not checkin_type or not logical_date:
+            continue
+        recent_key = announcement_key(site, name, checkin_type, logical_date, "cancel" if action == "cancel" else "checkin")
+        if time.time() - float(state["recent_announcements"].get(recent_key, 0) or 0) < 180:
+            continue
+        changed_at = str(event.get("changed_at") or "")
+        operation_time = ""
+        event_time = ""
+        try:
+            parsed = datetime.fromisoformat(changed_at.replace("Z", "+00:00")).astimezone(ZoneInfo(site.timezone))
+            operation_time = parsed.strftime("%Y-%m-%d %H:%M:%S")
+            event_time = parsed.strftime("%m-%d %H:%M")
+        except ValueError:
+            pass
+        cancelled = action == "cancel"
+        message = build_group_update(
+            site, name, checkin_type, logical_date,
+            cancelled=cancelled,
+            retro=bool(event.get("is_retro")),
+            operation_time=operation_time if cancelled else "",
+            event_time=event_time,
+            task_type=task_type,
+            task_id=int(event.get("task_id") or 0),
+            week_id=int(event.get("week_id") or 0),
+        )
+        delivery_key = f"{site.site_id}:{event.get('id')}:{changed_at}:{action}"
+        if broadcast_group_update(bot, accid, site, message, delivery_key) < len(site.chat_ids):
+            raise RuntimeError(f"网站事件通知未全部送达：site={site.site_id} event={event.get('id')}")
+        delivered += 1
+    next_cursor = str(payload.get("cursor") or cursor)
+    with state_lock:
+        state["website_event_cursors"][site.site_id] = next_cursor
+        state["website_event_deliveries"] = {
+            key: value for key, value in state["website_event_deliveries"].items()
+            if not key.startswith(f"{site.site_id}:")
+        }
+        save_state()
+    return delivered
+
+
+def broadcast_group_update(bot, accid: int, site: SiteConfig, message: str, delivery_key: str = "") -> int:
     delivered = 0
     for group_chat_id in sorted(site.chat_ids):
+        if delivery_key and group_chat_id in state["website_event_deliveries"].get(delivery_key, []):
+            delivered += 1
+            continue
         try:
             send(bot, accid, group_chat_id, message)
             delivered += 1
+            if delivery_key:
+                with state_lock:
+                    sent = state["website_event_deliveries"].setdefault(delivery_key, [])
+                    if group_chat_id not in sent:
+                        sent.append(group_chat_id)
+                        save_state()
         except Exception as error:
             bot.logger.exception("发送群通知失败：site=%s chat_id=%s error=%s", site.site_id, group_chat_id, error)
     return delivered
@@ -1498,30 +1953,72 @@ def announce_change(
 ) -> None:
     delivered = broadcast_group_update(bot, accid, site, message)
     if not is_group:
-        suffix = f"已通知 {delivered} 个群。" if delivered else "该网站还没有配置通知群。"
+        if delivered:
+            suffix = f"已通知 {delivered} 个群。"
+        elif site.chat_ids:
+            suffix = f"{site.name} 已配置通知群，但本次发送失败，请稍后重试。"
+        elif site.site_id == "zk" and SITE_BY_ID.get("cedar-zk") and SITE_BY_ID["cedar-zk"].chat_ids:
+            suffix = "本次操作在旧网站“科大”，而通知群绑定在 Cedar“科大门训”。两站数据独立；如需通知该群，请先发送“切换 cedar-zk”并绑定 Cedar 网站中的姓名，再在 Cedar 打卡。"
+        else:
+            suffix = f"本次操作的网站“{site.name}”没有绑定通知群。"
         send(bot, accid, origin_chat_id, f"{private_result}\n{suffix}")
     elif origin_chat_id not in site.chat_ids:
         send(bot, accid, origin_chat_id, message)
 
 
-def admin_help_text() -> str:
-    return "\n".join([
-        f"{BOT_NAME} · 管理员指令",
+def admin_help_text(super_admin: bool = False, group_admin: bool = False) -> str:
+    if not super_admin and not group_admin:
+        return "\n".join([
+            f"{BOT_NAME} · 管理员入口",
+            "",
+            "管理员状态 — 查看用户 ID 和当前权限",
+            "管理员验证 密钥 — 验证为超级管理员",
+            "",
+            "小组管理员请联系超级管理员授权。",
+            "权限验证、授权和群绑定请在私聊操作。",
+        ])
+    lines = [f"{BOT_NAME} · {'超级管理员' if super_admin else '小组管理员'}", ""]
+    if super_admin:
+        lines.extend([
+            "【全局管理】",
+            "管理员 网站状态 — 检查所有网站",
+            "管理员 群列表 — 查看网站与群 ID",
+            "管理员 绑定群 网站 群ID — 绑定通知群",
+            "管理员 绑定群 — 按提示选择 Cedar 小组和群聊",
+            "管理员 解绑群 — 按提示解除 Cedar 群绑定",
+            "",
+            "【权限管理】",
+            "管理员 小组管理员列表 — 查看授权",
+            "管理员 添加小组管理员 网站 用户ID — 授权",
+            "管理员 删除小组管理员 网站 用户ID — 取消授权",
+        ])
+    lines.extend([
         "",
-        "管理员验证 密钥 — 首次绑定（仅私聊）",
-        "管理员状态 — 查看管理员身份",
-        "管理员解除 — 解除自己的管理员身份",
+        "【小组操作】",
+        "管理员 成员列表 — 查看成员",
+        "管理员 设置加入日期 姓名 日期 — 修改统计起点",
+        "管理员 广播 内容 — 发送公告",
+        "管理员 发布灵修 — 发布今日灵修",
+        "管理员 立即提醒 早间/晚间 — 发送提醒",
+        "管理员 本周总结 / 历史总结 — 发布全组总结",
         "",
-        "管理员 网站状态 — 检查所有网站",
-        "管理员 成员列表 — 查看当前网站成员",
-        "管理员 群列表 — 查看网站与群 ID",
-        "管理员 绑定群 网站 群ID — 绑定通知群（仅私聊）",
-        "管理员 设置加入日期 网站 姓名 日期 — 修正统计起点（仅私聊）",
-        "管理员 广播 内容 — 广播到当前网站群聊",
-        "管理员 发布灵修 — 将当天灵修内容发到群聊",
-        "管理员 立即提醒 早间 — 立即发送早间提醒",
-        "管理员 立即提醒 晚间 — 立即发送晚间提醒",
+        "管理员状态 — 查看身份和管理范围",
+        "权限验证、授权和群绑定请在私聊操作；群内可发布灵修。",
     ])
+    return "\n".join(lines)
+
+
+def group_admin_list_text() -> str:
+    lines = ["🛡️ 小组管理员授权"]
+    configured = False
+    for configured_site in SITES:
+        member_ids = sorted((state.get("group_admins") or {}).get(configured_site.site_id, {}))
+        if member_ids:
+            configured = True
+            lines.append(f"{configured_site.name}：{'、'.join(member_ids)}")
+    if not configured:
+        lines.append("暂未设置小组管理员。")
+    return "\n".join(lines)
 
 
 def admin_group_list_text() -> str:
@@ -1542,18 +2039,25 @@ def site_config_row(site: SiteConfig) -> dict:
         "devotion_time": site.devotion_time,
         "morning_time": site.morning_time,
         "evening_time": site.evening_time,
+        "api_key": site.api_key,
         "enabled": True,
     }
 
 
-def bind_group_to_site(site: SiteConfig, group_id: int) -> SiteConfig:
-    """持久化网站群 ID 并刷新内存路由，使配置立即生效。"""
+def is_cedar_site(site: SiteConfig) -> bool:
+    return "/api/bot/groups/" in site.url
+
+
+def set_group_binding(site: SiteConfig, group_id: int, enabled: bool) -> SiteConfig:
+    """Persist Cedar group bindings and refresh in-memory routing immediately."""
     global SITES, SITE_BY_ID, SITE_BY_CHAT_ID, DEFAULT_SITE
     if os.getenv("MENXUN_SITES_JSON", "").strip():
         raise RuntimeError("当前使用 MENXUN_SITES_JSON 环境变量，无法在聊天中修改群配置。")
     existing = SITE_BY_CHAT_ID.get(group_id)
-    if existing and existing.site_id != site.site_id:
+    if enabled and existing and existing.site_id != site.site_id:
         raise ValueError(f"群 {group_id} 已绑定到 {existing.name}。")
+    if not enabled and (not existing or existing.site_id != site.site_id):
+        raise ValueError(f"群 {group_id} 当前没有绑定到 {site.name}。")
     with sites_lock:
         if SITES_FILE.exists():
             source = json.loads(SITES_FILE.read_text(encoding="utf-8-sig"))
@@ -1565,7 +2069,8 @@ def bind_group_to_site(site: SiteConfig, group_id: int) -> SiteConfig:
         matched = False
         for row in rows:
             if isinstance(row, dict) and str(row.get("id", "")).strip().lower() == site.site_id:
-                row["chat_ids"] = sorted(set(parse_chat_ids(row.get("chat_ids", []))) | {group_id})
+                chat_ids = set(parse_chat_ids(row.get("chat_ids", [])))
+                row["chat_ids"] = sorted(chat_ids | {group_id} if enabled else chat_ids - {group_id})
                 matched = True
                 break
         if not matched:
@@ -1574,7 +2079,17 @@ def bind_group_to_site(site: SiteConfig, group_id: int) -> SiteConfig:
         SITES_FILE.parent.mkdir(parents=True, exist_ok=True)
         temporary = SITES_FILE.with_suffix(".tmp")
         temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        temporary.replace(SITES_FILE)
+        try:
+            temporary.replace(SITES_FILE)
+        except OSError as error:
+            if error.errno != errno.EBUSY:
+                raise
+            # Docker single-file bind mounts cannot be replaced, but remain writable.
+            with SITES_FILE.open("w", encoding="utf-8") as mounted_file:
+                mounted_file.write(temporary.read_text(encoding="utf-8"))
+                mounted_file.flush()
+                os.fsync(mounted_file.fileno())
+            temporary.unlink()
         refreshed = load_sites()
         SITES = refreshed
         SITE_BY_ID = {item.site_id: item for item in refreshed}
@@ -1583,22 +2098,33 @@ def bind_group_to_site(site: SiteConfig, group_id: int) -> SiteConfig:
         return SITE_BY_ID[site.site_id]
 
 
+def bind_group_to_site(site: SiteConfig, group_id: int) -> SiteConfig:
+    return set_group_binding(site, group_id, True)
+
+
+def unbind_group_from_site(site: SiteConfig, group_id: int) -> SiteConfig:
+    return set_group_binding(site, group_id, False)
+
+
 def admin_site_status_text() -> str:
-    lines = ["🛡️ 网站运行状态"]
-    for configured_site in SITES:
+    def inspect(configured_site: SiteConfig) -> str:
         started = time.monotonic()
         try:
-            website_state, config = website_snapshot(configured_site)
+            website_state, config = website_snapshot(configured_site, retries=1)
             elapsed_ms = round((time.monotonic() - started) * 1000)
             members = len(website_state.get("members") or [])
             records = len(website_state.get("records") or [])
             schedule = website_state.get("weeklySchedule") or config.get("weekly_schedule") or []
-            lines.append(
+            return (
                 f"✅ {configured_site.site_id} · {configured_site.name}：{members} 名成员，"
                 f"{records} 条记录，{len(schedule)} 周配置，{elapsed_ms} ms"
             )
         except Exception as error:
-            lines.append(f"❌ {configured_site.site_id} · {configured_site.name}：{error}")
+            return f"❌ {configured_site.site_id} · {configured_site.name}：{error}"
+
+    with ThreadPoolExecutor(max_workers=min(8, len(SITES) or 1)) as pool:
+        statuses = list(pool.map(inspect, SITES))
+    lines = ["🛡️ 网站运行状态", *statuses]
     return "\n".join(lines)
 
 
@@ -1641,21 +2167,26 @@ def handle_admin_command(
         return False
     remainder = re.sub(r"^管理员\s*", "", command_text.strip(), count=1, flags=re.IGNORECASE)
     normalized = remainder.rstrip("！!。.").strip().lower()
+    if is_group and normalized.startswith(("验证", "解除", "绑定群", "解绑群", "设置加入日期", "添加小组管理员", "删除小组管理员")):
+        send(bot, accid, chat_id, "此管理操作只能私聊机器人进行。")
+        return True
 
     if normalized in {"", "帮助", "菜单"}:
-        send(bot, accid, chat_id, admin_help_text())
+        send(bot, accid, chat_id, admin_help_text(is_super_admin(member_id), is_group_admin(member_id)))
         return True
     if normalized == "状态":
         key_status = "已设置" if load_key_record(ADMIN_KEY_FILE) else "未设置"
-        identity = "已绑定管理员" if is_admin(member_id) else "普通用户"
-        send(bot, accid, chat_id, f"🛡️ 管理员状态\n身份：{identity}\n验证密钥：{key_status}")
+        if is_super_admin(member_id):
+            identity, scope = "超级管理员", "全部网站和小组"
+        else:
+            managed = [SITE_BY_ID[site_id].name for site_id in sorted(group_admin_site_ids(member_id)) if site_id in SITE_BY_ID]
+            identity = "小组管理员" if managed else "普通用户"
+            scope = "、".join(managed) if managed else "无"
+        send(bot, accid, chat_id, f"🛡️ 管理员状态\n用户 ID：{member_id}\n身份：{identity}\n管理范围：{scope}\n超级管理员密钥：{key_status}")
         return True
     if normalized.startswith("验证"):
-        if is_group:
-            send(bot, accid, chat_id, "管理员验证只能私聊机器人进行，避免密钥泄露。")
-            return True
-        if is_admin(member_id):
-            send(bot, accid, chat_id, "你已经绑定为管理员，无需再次验证。")
+        if is_super_admin(member_id):
+            send(bot, accid, chat_id, "你已经是超级管理员，无需再次验证。")
             return True
         secret = re.sub(r"^验证\s*[:：]?\s*", "", remainder, count=1, flags=re.IGNORECASE)
         if not secret:
@@ -1664,34 +2195,63 @@ def handle_admin_command(
         verified, result = verify_admin_attempt(member_id, secret)
         if verified:
             bind_admin(member_id)
-            send(bot, accid, chat_id, "✅ 管理员验证成功，当前用户已永久绑定。以后无需再次输入密钥。\n发送“管理员帮助”查看指令。")
+            send(bot, accid, chat_id, "✅ 超级管理员验证成功，当前用户已永久绑定。以后无需再次输入密钥。\n发送“管理员帮助”查看指令。")
         else:
             send(bot, accid, chat_id, f"❌ {result}")
         return True
     if normalized == "解除":
-        if not is_admin(member_id):
-            send(bot, accid, chat_id, "当前用户不是管理员。")
-        elif is_group:
-            send(bot, accid, chat_id, "为避免误操作，请私聊发送“管理员解除”。")
+        if not is_super_admin(member_id):
+            send(bot, accid, chat_id, "当前用户不是超级管理员；小组管理员权限需由超级管理员取消。")
         else:
             unbind_admin(member_id)
-            send(bot, accid, chat_id, "已解除当前用户的管理员身份。如需恢复，必须重新验证密钥。")
+            send(bot, accid, chat_id, "已解除当前用户的超级管理员身份。如需恢复，必须重新验证密钥。")
         return True
 
     if not is_admin(member_id):
-        send(bot, accid, chat_id, "此指令仅限管理员。请私聊发送“管理员验证 你的密钥”。")
+        send(bot, accid, chat_id, "此指令仅限管理员。请让超级管理员授权，或使用超级管理员密钥验证。")
         return True
     if normalized == "网站状态":
-        send(bot, accid, chat_id, admin_site_status_text())
+        if not is_super_admin(member_id):
+            send(bot, accid, chat_id, "此指令仅限超级管理员。小组管理员可查看当前小组的成员列表和总结。")
+        else:
+            send(bot, accid, chat_id, admin_site_status_text())
         return True
     if normalized == "群列表":
-        send(bot, accid, chat_id, admin_group_list_text())
+        if not is_super_admin(member_id):
+            send(bot, accid, chat_id, "此指令仅限超级管理员。")
+        else:
+            send(bot, accid, chat_id, admin_group_list_text())
+        return True
+    if normalized == "小组管理员列表":
+        send(bot, accid, chat_id, group_admin_list_text() if is_super_admin(member_id) else "此指令仅限超级管理员。")
+        return True
+    if normalized.startswith(("添加小组管理员", "删除小组管理员")):
+        if not is_super_admin(member_id):
+            send(bot, accid, chat_id, "此指令仅限超级管理员。")
+            return True
+        enabled = normalized.startswith("添加小组管理员")
+        verb = "添加小组管理员" if enabled else "删除小组管理员"
+        value = re.sub(rf"^{verb}\s*[:：]?\s*", "", remainder, count=1, flags=re.IGNORECASE).strip()
+        parts = value.rsplit(maxsplit=1)
+        selected_site = find_site(parts[0]) if len(parts) == 2 else None
+        if not selected_site or not parts[1].isdigit():
+            send(bot, accid, chat_id, f"请输入：管理员 {verb} 网站 用户ID\n用户可发送“管理员状态”查看自己的用户 ID。")
+            return True
+        target_id = int(parts[1])
+        if is_super_admin(target_id) and not enabled:
+            send(bot, accid, chat_id, "该用户是超级管理员；请由其本人发送“管理员解除”。")
+            return True
+        set_group_admin(target_id, selected_site, enabled)
+        send(bot, accid, chat_id, f"✅ 已{'授权' if enabled else '取消授权'}：用户 {target_id} / {selected_site.name}")
         return True
     if normalized.startswith("绑定群"):
-        if is_group:
-            send(bot, accid, chat_id, "绑定群 ID 只能私聊机器人操作。")
+        if not is_super_admin(member_id):
+            send(bot, accid, chat_id, "绑定通知群仅限超级管理员。")
             return True
         value = re.sub(r"^绑定群\s*[:：]?\s*", "", remainder, count=1, flags=re.IGNORECASE).strip()
+        if not value:
+            send(bot, accid, chat_id, admin_bind_group_guide())
+            return True
         parts = value.rsplit(maxsplit=1)
         if len(parts) == 1 and parts[0].isdigit() and site:
             selected_site, group_text = site, parts[0]
@@ -1700,7 +2260,7 @@ def handle_admin_command(
         else:
             selected_site, group_text = None, ""
         if not selected_site or not group_text.isdigit():
-            send(bot, accid, chat_id, "请输入：管理员 绑定群 网站名称 群ID\n例如：管理员 绑定群 科大 11")
+            send(bot, accid, chat_id, "没有识别出网站或群 ID。\n\n" + admin_bind_group_guide())
             return True
         group_id = int(group_text)
         try:
@@ -1734,6 +2294,9 @@ def handle_admin_command(
         if not selected_site or not target_name or not join_day:
             send(bot, accid, chat_id, "请输入：管理员 设置加入日期 网站 姓名 YYYY-MM-DD\n例如：管理员 设置加入日期 科大 张三 2026-01-01")
             return True
+        if not is_super_admin(member_id) and not is_group_admin(member_id, selected_site):
+            send(bot, accid, chat_id, f"你没有 {selected_site.name} 的管理权限。")
+            return True
         current_day = now(selected_site).date()
         if join_day < date(2000, 1, 1) or join_day > current_day:
             send(bot, accid, chat_id, f"加入日期必须在 2000-01-01 至 {current_day.isoformat()} 之间。")
@@ -1751,12 +2314,17 @@ def handle_admin_command(
     if normalized == "成员列表":
         if not site:
             send(bot, accid, chat_id, "请先发送“网站”，再切换到需要查看的网站。")
+        elif not is_super_admin(member_id) and not is_group_admin(member_id, site):
+            send(bot, accid, chat_id, f"你没有 {site.name} 的管理权限。")
         else:
             send(bot, accid, chat_id, admin_member_list_text(site))
         return True
     if normalized.startswith("广播"):
         if not site:
             send(bot, accid, chat_id, "请先选择要广播的网站。")
+            return True
+        if not is_super_admin(member_id) and not is_group_admin(member_id, site):
+            send(bot, accid, chat_id, f"你没有 {site.name} 的管理权限。")
             return True
         content = re.sub(r"^广播\s*[:：]?\s*", "", remainder, count=1, flags=re.IGNORECASE)
         if not content:
@@ -1770,6 +2338,9 @@ def handle_admin_command(
         if not site:
             send(bot, accid, chat_id, "请先选择要发布灵修的网站。")
             return True
+        if not is_super_admin(member_id) and not is_group_admin(member_id, site):
+            send(bot, accid, chat_id, f"你没有 {site.name} 的管理权限。")
+            return True
         delivered = publish_daily_devotion(bot, accid, site)
         if is_group and chat_id in site.chat_ids:
             send(bot, accid, chat_id, f"✅ 今日灵修已发布。")
@@ -1780,6 +2351,9 @@ def handle_admin_command(
         if not site:
             send(bot, accid, chat_id, "请先选择要提醒的网站。")
             return True
+        if not is_super_admin(member_id) and not is_group_admin(member_id, site):
+            send(bot, accid, chat_id, f"你没有 {site.name} 的管理权限。")
+            return True
         value = re.sub(r"^立即提醒\s*", "", normalized)
         reminder_kind = "morning" if value in {"早间", "早上", "早晨"} else "evening" if value in {"晚间", "晚上"} else ""
         if not reminder_kind:
@@ -1789,7 +2363,7 @@ def handle_admin_command(
         send(bot, accid, chat_id, f"✅ {('早间' if reminder_kind == 'morning' else '晚间')}提醒已发送到 {delivered} 个群。")
         return True
 
-    send(bot, accid, chat_id, "没有识别该管理员指令。\n\n" + admin_help_text())
+    send(bot, accid, chat_id, "没有识别该管理员指令。\n\n" + admin_help_text(is_super_admin(member_id), is_group_admin(member_id)))
     return True
 
 
@@ -1808,6 +2382,12 @@ def on_new_message(bot, accid: int, event) -> None:
         if not text:
             return
         bot.logger.info("收到消息：chat_id=%s text=%r", chat_id, safe_log_text(raw_text))
+        if not is_group:
+            flow = workflows.get(accid)
+            if flow is None:
+                flow = workflows[accid] = DeltaWorkflows(sys.modules[__name__], bot, accid)
+            if flow.handle(chat_id, member_id, command_text):
+                return
         if handle_admin_command(bot, accid, chat_id, member_id, is_group, site, command_text):
             return
         if text in {"帮助", "菜单"}:
@@ -1870,6 +2450,16 @@ def on_new_message(bot, accid: int, event) -> None:
         if text in {"灵修", "今日灵修", "灵修内容"}:
             send(bot, accid, chat_id, daily_devotion_text(site))
             return
+        if text in {"小组读经状态", "群读经状态", "小组读经", "群读经"}:
+            send(bot, accid, chat_id, reading_status(site))
+            return
+        if text in {"每日读经", "今日读经", "微读圣经", "微读", "读经", "读经状态", "每日读经状态", "微读状态", "我的读经状态", "个人读经状态", "我的读经记录", "个人读经记录", "读经记录"}:
+            name = bound_name(member_id, site)
+            if not name:
+                send(bot, accid, chat_id, f"请先绑定 {site.name} 的身份，例如：绑定 你的姓名")
+                return
+            send(bot, accid, chat_id, reading_status(site, name, 30 if "记录" in text else 7))
+            return
         if text.startswith("提醒") and text != "提醒":
             if is_group:
                 send(bot, accid, chat_id, "暖心提醒只能私聊机器人发送。")
@@ -1882,7 +2472,7 @@ def on_new_message(bot, accid: int, event) -> None:
             send(bot, accid, chat_id, result)
             return
         if text in {"状态", "进度"}:
-            send(bot, accid, chat_id, "请选择：\n· 我的状态\n· 我的月状态\n· 门训总结\n· 群状态")
+            send(bot, accid, chat_id, "请选择：\n· 我的状态\n· 我的月状态\n· 门训总结\n· 群状态\n· 我的读经状态\n· 我的读经记录\n· 小组读经状态")
             return
         if text in {"群状态", "小组状态", "群进度"}:
             send(bot, accid, chat_id, website_status(site))
@@ -1902,7 +2492,7 @@ def on_new_message(bot, accid: int, event) -> None:
             except ValueError:
                 send(bot, accid, chat_id, "月份格式不正确。\n请发送“我的月状态”，或例如“我的月状态 2026-07”。")
             return
-        if text in {"门训总结", "进度总结", "历史总结", "我的总结"}:
+        if text in {"门训总结", "进度总结", "我的总结"}:
             name = bound_name(member_id, site)
             send(bot, accid, chat_id, member_history_summary(site, name) if name else f"请先绑定 {site.name} 的身份，例如：绑定 你的姓名")
             return
