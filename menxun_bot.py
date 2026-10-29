@@ -1587,7 +1587,7 @@ def checkin_timeline(
     ordered = sorted(first_by_name.items(), key=lambda item: (item[1][0], item[0]))
     display_type = {"每日灵修": "灵修", "周读物": "周读物", "周视频": "视频", "周背经": "背经"}[checkin_type]
     scope = f"{logical_date} · " if checkin_type == "每日灵修" else "本周"
-    title = f"{scope}{display_type}（按时间）"
+    title = f"{scope}{display_type}"
     rows = []
     for index, (name, (_, value)) in enumerate(ordered, start=1):
         if value:
@@ -1628,7 +1628,7 @@ def bot_api_checkin_timeline(
         if name not in first_by_name or sort_value < first_by_name[name][0]:
             first_by_name[name] = (sort_value, value)
     ordered = sorted(first_by_name.items(), key=lambda item: (item[1][0], item[0]))
-    title = f"{logical_date} · {label}（按时间）" if daily else f"本周 · {label}（按时间）"
+    title = f"{logical_date} · {label}" if daily else f"本周 · {label}"
     rows = []
     for index, (name, (_, value)) in enumerate(ordered, 1):
         time_text = value.strftime("%H:%M" if daily else "%m-%d %H:%M") if value else "时间未知"
@@ -2139,15 +2139,32 @@ def admin_member_list_text(site: SiteConfig) -> str:
 def build_reminder_message(bot, site: SiteConfig, reminder_kind: str) -> str:
     try:
         _, config = website_snapshot(site)
+        today = now(site).date()
+        sections = config.get("task_sections") or {}
+        daily = sections.get("daily") or {}
+        devotion = daily.get("devotion") or {}
+        plan = current_week(config, today)
+        lines = [f"{'☀️ 早安提醒' if reminder_kind == 'morning' else '🌙 晚间门训提醒'}", f"{site.name} · {today.isoformat()}"]
         if reminder_kind == "morning":
-            return (
-                f"☀️ {site.name} · 早安提醒\n{task_summary(config, site=site)}\n\n"
-                "请完成灵修和读经后，在私聊中绑定姓名并发送“打卡 灵修”。"
-            )
-        return (
-            f"🌙 {site.name} · 晚间门训提醒\n{task_summary(config, site=site)}\n\n"
-            "完成后发送“打卡 周读物”“打卡 视频”或“打卡 背经”。"
-        )
+            lines += ["", "📖 今日学习", f"· 灵修：{devotion.get('title') or '请完成今日灵修'}"]
+            scripture = current_scripture(config, today)
+            lines.append(f"· 读经：{scripture or '请完成今日读经'}")
+            lines += ["", "完成后可在网站打卡，也可私聊机器人发送：打卡 灵修"]
+        else:
+            lines += ["", "📚 本周任务"]
+            if plan:
+                readings = [str(item.get('title')).strip() for item in (plan.get('readings') or []) if isinstance(item, dict) and item.get('title')]
+                book = '；'.join(readings[:3]) or format_title(plan.get('title'))
+                videos = plan.get('videos') or []
+                video = videos[0].get('title') if videos and isinstance(videos[0], dict) else plan.get('video')
+                verse = plan.get('verse') or plan.get('reciteText')
+                for label, value in (("周读物", book), ("视频", video), ("背经", verse)):
+                    if value:
+                        lines.append(f"· {label}：{value}")
+            else:
+                lines.append("网站暂未配置本周任务")
+            lines += ["", "完成后可在网站打卡，或私聊机器人发送相应的打卡指令。"]
+        return "\n".join(lines)
     except Exception as error:
         bot.logger.warning("读取提醒内容失败：site=%s error=%s", site.site_id, error)
         return f"⏰ {site.name} 门训提醒\n请完成今天的门训任务，发送“任务”可查看安排。"
