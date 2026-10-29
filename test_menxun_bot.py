@@ -67,6 +67,18 @@ class MenxunBotTests(unittest.TestCase):
         self.assertGreaterEqual(bot.WEBSITE_POLL_INTERVAL, 2)
         self.assertLessEqual(bot.WEBSITE_POLL_INTERVAL, 60)
 
+    def test_reminders_are_separated_by_time_of_day(self):
+        config = {"weekly_schedule": self.schedule, "task_sections": {"daily": {"devotion": {"title": "今日灵修"}}}}
+        fake_bot = SimpleNamespace(logger=SimpleNamespace(warning=lambda *_args: None))
+        with patch.object(bot, "website_snapshot", return_value=({}, config)), patch.object(bot, "now", return_value=datetime(2026, 8, 21, 8, 30)):
+            morning = bot.build_reminder_message(fake_bot, self.site, "morning")
+            evening = bot.build_reminder_message(fake_bot, self.site, "evening")
+        self.assertIn("📖 今日学习\n· 灵修：今日灵修", morning)
+        self.assertNotIn("本周任务", morning)
+        self.assertIn("📚 本周任务\n· 周读物：本周读物", evening)
+        self.assertIn("· 视频：本周视频", evening)
+        self.assertNotIn("今日学习", evening)
+
     def test_daily_uses_exact_logical_date(self):
         record = {"name": "张迦勒", "logical_date": "2026-08-20", "daily": "done"}
         self.assertTrue(bot.website_record_matches(record, "张迦勒", "每日灵修", date(2026, 8, 20), self.schedule, self.site))
@@ -154,7 +166,7 @@ class MenxunBotTests(unittest.TestCase):
         ]
         with patch.object(bot, "website_snapshot", return_value=({"records": records}, {"weekly_schedule": self.schedule})):
             title, rows = bot.checkin_timeline(self.site, "每日灵修", "2026-08-21")
-        self.assertEqual(title, "2026-08-21 · 灵修（按时间）")
+        self.assertEqual(title, "2026-08-21 · 灵修")
         self.assertEqual(rows, ["1. 08:10  甲", "2. 09:30  乙"])
 
     def test_private_checkin_notifies_groups_and_confirms_privately(self):
@@ -267,7 +279,7 @@ class MenxunBotTests(unittest.TestCase):
             self.assertEqual(bot.poll_bot_api_events(SimpleNamespace(), 1, api_site), 1)
         message = broadcast.call_args.args[3]
         self.assertIn("甲打卡了：生命操练", message)
-        self.assertIn("本周 · 生命操练（按时间）\n1. 09-22 12:00  甲", message)
+        self.assertIn("本周 · 生命操练\n1. 09-22 12:00  甲", message)
 
     def test_bot_api_custom_task_uses_time_ordered_group_list(self):
         api_site = bot.SiteConfig(
@@ -286,7 +298,7 @@ class MenxunBotTests(unittest.TestCase):
             message = bot.build_group_update(api_site, "乙", "生命操练", "2026-09-22",
                                              task_type="weekly_checkin", task_id=7, week_id=3)
         self.assertIn("📌 乙打卡了：生命操练", message)
-        self.assertIn("本周 · 生命操练（按时间）\n1. 09-22 09:00  甲\n2. 09-22 10:00  乙", message)
+        self.assertIn("本周 · 生命操练\n1. 09-22 09:00  甲\n2. 09-22 10:00  乙", message)
         self.assertNotIn("丙", message)
 
     def test_every_cedar_task_uses_same_full_timeline_layout(self):
@@ -295,13 +307,13 @@ class MenxunBotTests(unittest.TestCase):
             url="https://example.test/api/bot/groups/yds-hz", chat_ids=frozenset({101}),
         )
         cases = (
-            ("daily_devotion", "每日灵修", 0, 0, "2026-09-20 · 灵修（按时间）", "06:28", "🙏"),
-            ("daily_scripture", "每日读经", 0, 0, "2026-09-20 · 每日读经（按时间）", "06:28", "📖"),
-            ("weekly_checkin", "生命操练", 7, 3, "本周 · 生命操练（按时间）", "09-20 06:28", "📌"),
-            ("weekly_book", "周读物", 8, 3, "本周 · 周读物（按时间）", "09-20 06:28", "📚"),
-            ("weekly_video", "周视频", 9, 3, "本周 · 视频（按时间）", "09-20 06:28", "🎬"),
-            ("weekly_verse", "周背经", 10, 3, "本周 · 背经（按时间）", "09-20 06:28", "🧠"),
-            ("weekly_outline", "提纲背诵", 11, 3, "本周 · 提纲背诵（按时间）", "09-20 06:28", "📝"),
+            ("daily_devotion", "每日灵修", 0, 0, "2026-09-20 · 灵修", "06:28", "🙏"),
+            ("daily_scripture", "每日读经", 0, 0, "2026-09-20 · 每日读经", "06:28", "📖"),
+            ("weekly_checkin", "生命操练", 7, 3, "本周 · 生命操练", "09-20 06:28", "📌"),
+            ("weekly_book", "周读物", 8, 3, "本周 · 周读物", "09-20 06:28", "📚"),
+            ("weekly_video", "周视频", 9, 3, "本周 · 视频", "09-20 06:28", "🎬"),
+            ("weekly_verse", "周背经", 10, 3, "本周 · 背经", "09-20 06:28", "🧠"),
+            ("weekly_outline", "提纲背诵", 11, 3, "本周 · 提纲背诵", "09-20 06:28", "📝"),
         )
         for task_type, label, task_id, week_id, title, time_text, icon in cases:
             with self.subTest(task_type=task_type):
@@ -325,7 +337,7 @@ class MenxunBotTests(unittest.TestCase):
                 self.assertNotIn("别组成员", message)
 
     def test_cancel_group_update_includes_operation_time(self):
-        with patch.object(bot, "checkin_timeline", return_value=("当天灵修（按时间）", [])):
+        with patch.object(bot, "checkin_timeline", return_value=("当天灵修", [])):
             text = bot.build_group_update(
                 self.site,
                 "乙",
@@ -360,7 +372,7 @@ class MenxunBotTests(unittest.TestCase):
         self.assertEqual([call.args[3] for call in broadcast.call_args_list], ["取消", "打卡"])
 
     def test_checkin_notification_never_says_checked_in_then_empty(self):
-        with patch.object(bot, "checkin_timeline", return_value=("本周背经（按时间）", [])):
+        with patch.object(bot, "checkin_timeline", return_value=("本周背经", [])):
             text = bot.build_group_update(
                 self.site,
                 "信择",
