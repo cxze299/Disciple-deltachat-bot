@@ -339,6 +339,20 @@ def safe_log_text(raw_text: str) -> str:
     return raw_text
 
 
+def send_devotion(bot, accid: int, chat_id: int, text: str) -> None:
+    """用短纯文本消息展示灵修，避免客户端转入完整 HTML 阅读页。"""
+    text = text.replace("**", "")
+    text = re.sub(r"\[([^\]\n]+)\]\((https?://[^\s)]+)\)", r"\1：\2", text)
+    while text:
+        end = min(len(text), 800)
+        if len(text) > end:
+            boundary = text.rfind("\n", 0, end)
+            if boundary > end // 2:
+                end = boundary + 1
+        bot.rpc.send_msg(accid, chat_id, MessageData(text=text[:end]))
+        text = text[end:]
+
+
 def send(bot, accid: int, chat_id: int, text: str) -> None:
     reader_links = list(re.finditer(r"\[([^\]\n]+)\]\((https://[^\s)]+\?reader_source=[^\s)]+)\)", text))
     if "**" not in text and not reader_links:
@@ -1932,7 +1946,7 @@ def publish_daily_devotion(bot, accid: int, site: SiteConfig, message: str | Non
     delivered = 0
     for group_chat_id in sorted(site.chat_ids):
         try:
-            send(bot, accid, group_chat_id, message)
+            send_devotion(bot, accid, group_chat_id, message)
             with state_lock:
                 state["reminded"][f"{site.site_id}:{target_date}:devotion:{group_chat_id}"] = now(site).isoformat()
                 save_state()
@@ -2465,7 +2479,7 @@ def on_new_message(bot, accid: int, event) -> None:
             send(bot, accid, chat_id, f"🌐 {site.name}\n" + task_summary(config, site=site))
             return
         if text in {"灵修", "今日灵修", "灵修内容"}:
-            send(bot, accid, chat_id, daily_devotion_text(site))
+            send_devotion(bot, accid, chat_id, daily_devotion_text(site))
             return
         if text in {"小组读经状态", "群读经状态", "小组读经", "群读经"}:
             send(bot, accid, chat_id, reading_status(site))
@@ -2683,7 +2697,10 @@ def reminder_loop(bot, accid: int) -> None:
                 continue
             for chat_id in pending_chat_ids:
                 try:
-                    send(bot, accid, chat_id, message)
+                    if reminder_kind == "devotion":
+                        send_devotion(bot, accid, chat_id, message)
+                    else:
+                        send(bot, accid, chat_id, message)
                     with state_lock:
                         state["reminded"][f"{reminder_prefix}:{chat_id}"] = now(site).isoformat()
                         save_state()

@@ -29,6 +29,18 @@ class FakeResponse:
 
 
 class MenxunBotTests(unittest.TestCase):
+    def test_devotion_plain_chunks_preserve_content(self):
+        from unittest.mock import Mock
+        client = Mock()
+        content = "“经文”\n" * 600
+        bot.send_devotion(client, 1, 15, "**" + content + "**")
+        messages = [call.args[2] for call in client.rpc.send_msg.call_args_list]
+        self.assertGreater(len(messages), 1)
+        self.assertEqual("".join(m.text for m in messages), content)
+        self.assertTrue(all(len(m.text) <= 800 for m in messages))
+        self.assertTrue(all(not m.html for m in messages))
+
+
     def test_existing_site_name_uses_menxun_without_changing_bindings(self):
         site = bot.SiteConfig("cedar-zk", "香柏木门训 / 科大门训", "https://example.test/api/bot/groups/zk", frozenset({84801506}))
         self.assertEqual(site.name, "门训 / 科大门训")
@@ -722,7 +734,7 @@ class MenxunBotTests(unittest.TestCase):
         temporary_state = {"reminded": {}}
         fixed_now = datetime(2026, 8, 25, 5, 30)
         fake_bot = SimpleNamespace(logger=SimpleNamespace(exception=lambda *_args: None))
-        with patch.object(bot, "state", temporary_state), patch.object(bot, "save_state"), patch.object(bot, "now", return_value=fixed_now), patch.object(bot, "send") as send:
+        with patch.object(bot, "state", temporary_state), patch.object(bot, "save_state"), patch.object(bot, "now", return_value=fixed_now), patch.object(bot, "send_devotion") as send:
             delivered = bot.publish_daily_devotion(fake_bot, 1, self.site, "今日灵修")
         self.assertEqual(delivered, 1)
         send.assert_called_once_with(fake_bot, 1, 101, "今日灵修")
