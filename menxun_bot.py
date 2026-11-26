@@ -1227,9 +1227,12 @@ def website_cancel_checkin(
     return True, f"已取消 {logical_date} 的{checkin_type}记录{count_text}。"
 
 
-def website_status(site: SiteConfig, name: str = "") -> str:
+CHECKIN_DIGEST_TIMES = ("12:00", "23:30")
+
+
+def website_status(site: SiteConfig, name: str = "", *, digest_time: str = "") -> str:
     website_state, config = website_snapshot(site)
-    today = now(site).date()
+    today = (now(site).astimezone(ZoneInfo("Asia/Shanghai")) if digest_time else now(site)).date()
     today_text = today.isoformat()
     weekly_schedule = website_state.get("weeklySchedule") or config.get("weekly_schedule") or []
     records = website_state.get("records") or []
@@ -1256,6 +1259,28 @@ def website_status(site: SiteConfig, name: str = "") -> str:
         for column, (_, checkin_type) in types.items()
     }
     members = [str(item).strip() for item in (website_state.get("members") or []) if str(item).strip()]
+    if digest_time:
+        members = list(dict.fromkeys(members))
+        heading = "午间打卡汇总" if digest_time == "12:00" else "晚间打卡汇总"
+        lines = [f"📊 {heading}", f"{site.name} · {today_text} · {digest_time}"]
+        if not members:
+            return "\n".join([*lines, "暂无成员"])
+        week = current_week(weekly_schedule, today)
+        if not week:
+            lines.append("本周暂无周任务计划")
+        for column, (label, checkin_type) in types.items():
+            if column != "daily" and (not week or not weekly_task_value(week, checkin_type)):
+                continue
+            pending = [member for member in members if member not in completed[column]]
+            count = len(members) - len(pending)
+            scope = "今日" if column == "daily" else "本周"
+            lines.append(f"{scope}{label.removeprefix('周')} · {count}/{len(members)}（{count / len(members):.0%}）")
+            if pending:
+                shown = "、".join(pending[:6])
+                more = f"等 {len(pending)} 人" if len(pending) > 6 else ""
+                lines.append(f"待完成：{shown}{more}")
+        return "\n".join(lines)
+
     member_order = {member: index for index, member in enumerate(members)}
 
     def ordered_names(names: set[str]) -> list[str]:
@@ -1956,30 +1981,6 @@ def publish_daily_devotion(bot, accid: int, site: SiteConfig, message: str | Non
     return delivered
 
 
-def announce_change(
-    bot,
-    accid: int,
-    origin_chat_id: int,
-    is_group: bool,
-    site: SiteConfig,
-    message: str,
-    private_result: str,
-) -> None:
-    delivered = broadcast_group_update(bot, accid, site, message)
-    if not is_group:
-        if delivered:
-            suffix = f"已通知 {delivered} 个群。"
-        elif site.chat_ids:
-            suffix = f"{site.name} 已配置通知群，但本次发送失败，请稍后重试。"
-        elif site.site_id == "zk" and SITE_BY_ID.get("cedar-zk") and SITE_BY_ID["cedar-zk"].chat_ids:
-            suffix = "本次操作在旧网站“科大”，而通知群绑定在 Cedar“科大门训”。两站数据独立；如需通知该群，请先发送“切换 cedar-zk”并绑定 Cedar 网站中的姓名，再在 Cedar 打卡。"
-        else:
-            suffix = f"本次操作的网站“{site.name}”没有绑定通知群。"
-        send(bot, accid, origin_chat_id, f"{private_result}\n{suffix}")
-    elif origin_chat_id not in site.chat_ids:
-        send(bot, accid, origin_chat_id, message)
-
-
 def admin_help_text(super_admin: bool = False, group_admin: bool = False) -> str:
     if not super_admin and not group_admin:
         return "\n".join([
@@ -2549,24 +2550,8 @@ def on_new_message(bot, accid: int, event) -> None:
                 bot.logger.exception("网站 %s 补签同步失败：%s", site.site_id, error)
                 ok, result = False, "网站暂时不可用，本次补签没有写入，请稍后重试。"
             if ok:
-                remember_announced_change(site, name, checkin_type, logical_date)
-                message = build_group_update(
-                    site,
-                    name,
-                    checkin_type,
-                    logical_date,
-                    retro=True,
-                    event_time=now(site).strftime("%m-%d %H:%M"),
-                )
-                announce_change(
-                    bot,
-                    accid,
-                    chat_id,
-                    is_group,
-                    site,
-                    message,
-                    f"✅ 补签成功：{site.name} / {name} / {logical_date} / {checkin_type}",
-                )
+                if not is_group:
+                    send(bot, accid, chat_id, f"✅ 补签成功：{site.name} / {name} / {logical_date} / {checkin_type}")
             else:
                 send(bot, accid, chat_id, f"ℹ️ {result}")
             return
@@ -2593,26 +2578,8 @@ def on_new_message(bot, accid: int, event) -> None:
                 bot.logger.exception("网站 %s 取消打卡失败：%s", site.site_id, error)
                 ok, result = False, "网站暂时无法连接，取消失败，请稍后再试。"
             if ok:
-                operation_time = now(site).strftime("%Y-%m-%d %H:%M:%S")
-                remember_announced_change(site, name, checkin_type, logical_date, action="cancel")
-                message = build_group_update(
-                    site,
-                    name,
-                    checkin_type,
-                    logical_date,
-                    cancelled=True,
-                    retro=retro_only,
-                    operation_time=operation_time,
-                )
-                announce_change(
-                    bot,
-                    accid,
-                    chat_id,
-                    is_group,
-                    site,
-                    message,
-                    f"↩️ 取消打卡成功：{site.name} / {name} / {logical_date} / {checkin_type}",
-                )
+                if not is_group:
+                    send(bot, accid, chat_id, f"↩️ 取消打卡成功：{site.name} / {name} / {logical_date} / {checkin_type}")
             else:
                 send(bot, accid, chat_id, f"ℹ️ {result}")
             return
@@ -2632,24 +2599,8 @@ def on_new_message(bot, accid: int, event) -> None:
                 bot.logger.exception("网站 %s 打卡同步失败：%s", site.site_id, error)
                 ok, result = False, "网站暂时不可用，本次打卡没有写入，请稍后重试。"
             if ok:
-                logical_date = now(site).date().isoformat()
-                remember_announced_change(site, name, checkin_type, logical_date)
-                message = build_group_update(
-                    site,
-                    name,
-                    checkin_type,
-                    logical_date,
-                    event_time=now(site).strftime("%m-%d %H:%M"),
-                )
-                announce_change(
-                    bot,
-                    accid,
-                    chat_id,
-                    is_group,
-                    site,
-                    message,
-                    f"✅ 打卡成功：{site.name} / {name} / {checkin_type}",
-                )
+                if not is_group:
+                    send(bot, accid, chat_id, f"✅ 打卡成功：{site.name} / {name} / {checkin_type}")
             else:
                 send(bot, accid, chat_id, f"ℹ️ {result}")
             return
@@ -2662,6 +2613,32 @@ def on_new_message(bot, accid: int, event) -> None:
         send(bot, accid, chat_id, "门训网站暂时无法连接或配置有误，请稍后再试。")
 
 
+def deliver_scheduled_reminder(bot, accid: int, site: SiteConfig, kind: str, scheduled_at: datetime) -> None:
+    prefix = f"{site.site_id}:{scheduled_at.date().isoformat()}:{kind}"
+    pending = [chat_id for chat_id in sorted(site.chat_ids) if not state["reminded"].get(f"{prefix}:{chat_id}")]
+    if not pending:
+        return
+    try:
+        if kind.startswith("digest-"):
+            message = website_status(site, digest_time=kind.removeprefix("digest-"))
+        elif kind == "devotion":
+            message = daily_devotion_text(site)
+        else:
+            message = build_reminder_message(bot, site, kind)
+    except Exception:
+        bot.logger.exception("生成定时消息失败：site=%s kind=%s", site.site_id, kind)
+        return
+    for chat_id in pending:
+        try:
+            sender = send_devotion if kind == "devotion" else send
+            sender(bot, accid, chat_id, message)
+            with state_lock:
+                state["reminded"][f"{prefix}:{chat_id}"] = now(site).isoformat()
+                save_state()
+        except Exception:
+            bot.logger.exception("发送定时消息失败：site=%s kind=%s chat_id=%s", site.site_id, kind, chat_id)
+
+
 def reminder_loop(bot, accid: int) -> None:
     if not any(site.chat_ids for site in SITES):
         bot.logger.warning("所有网站都未设置 chat_ids，定时提醒不会广播；收到私聊消息仍会响应。")
@@ -2670,42 +2647,24 @@ def reminder_loop(bot, accid: int) -> None:
         for site in SITES:
             if not site.chat_ids:
                 continue
-            try:
-                poll_website_notifications(bot, accid, site)
-            except Exception as error:
-                bot.logger.exception("监听网站打卡失败：site=%s error=%s", site.site_id, error)
             current = now(site)
-            if reminder_due(current, site.devotion_time):
-                reminder_kind = "devotion"
-            elif reminder_due(current, site.morning_time):
-                reminder_kind = "morning"
-            elif reminder_due(current, site.evening_time):
-                reminder_kind = "evening"
-            else:
-                continue
-            reminder_prefix = f"{site.site_id}:{current.date().isoformat()}:{reminder_kind}"
-            pending_chat_ids = [
-                chat_id for chat_id in site.chat_ids
-                if not state["reminded"].get(f"{reminder_prefix}:{chat_id}")
+            china_time = current.astimezone(ZoneInfo("Asia/Shanghai"))
+            scheduled = [
+                (kind, current)
+                for kind, target in (
+                    ("devotion", site.devotion_time),
+                    ("morning", site.morning_time),
+                    ("evening", site.evening_time),
+                )
+                if reminder_due(current, target)
             ]
-            if not pending_chat_ids:
-                continue
-            try:
-                message = daily_devotion_text(site) if reminder_kind == "devotion" else build_reminder_message(bot, site, reminder_kind)
-            except Exception as error:
-                bot.logger.exception("读取定时灵修失败，将在下一轮重试：site=%s error=%s", site.site_id, error)
-                continue
-            for chat_id in pending_chat_ids:
-                try:
-                    if reminder_kind == "devotion":
-                        send_devotion(bot, accid, chat_id, message)
-                    else:
-                        send(bot, accid, chat_id, message)
-                    with state_lock:
-                        state["reminded"][f"{reminder_prefix}:{chat_id}"] = now(site).isoformat()
-                        save_state()
-                except Exception as error:
-                    bot.logger.exception("发送提醒失败：site=%s chat_id=%s error=%s", site.site_id, chat_id, error)
+            scheduled.extend(
+                (f"digest-{target}", china_time)
+                for target in CHECKIN_DIGEST_TIMES
+                if reminder_due(china_time, target, grace_minutes=30)
+            )
+            for kind, scheduled_at in scheduled:
+                deliver_scheduled_reminder(bot, accid, site, kind, scheduled_at)
         time.sleep(WEBSITE_POLL_INTERVAL)
 
 
