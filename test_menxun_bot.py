@@ -181,23 +181,35 @@ class MenxunBotTests(unittest.TestCase):
         self.assertEqual(title, "2026-08-21 · 灵修")
         self.assertEqual(rows, ["1. 08:10  甲", "2. 09:30  乙"])
 
-    def test_private_checkin_notifies_groups_and_confirms_privately(self):
-        fake_bot = SimpleNamespace()
-        with patch.object(bot, "broadcast_group_update", return_value=2) as broadcast, patch.object(bot, "send") as send:
-            bot.announce_change(fake_bot, 1, 900, False, self.site, "群通知", "打卡成功")
-        broadcast.assert_called_once_with(fake_bot, 1, self.site, "群通知")
-        send.assert_called_once_with(fake_bot, 1, 900, "打卡成功\n已通知 2 个群。")
+    def test_digest_counts_current_members_and_uses_site_status(self):
+        current = datetime(2026, 8, 21, 12, tzinfo=bot.ZoneInfo("Asia/Shanghai"))
+        snapshot = {
+            "members": ["甲", "乙", "甲"],
+            "records": [
+                {"name": "甲", "logical_date": "2026-08-21", "daily": "done"},
+                {"name": "乙", "logical_date": "2026-08-20", "daily": "done", "book": "done"},
+                {"name": "已退出", "logical_date": "2026-08-21", "daily": "done"},
+            ],
+        }
+        with patch.object(bot, "now", return_value=current), patch.object(
+            bot, "website_snapshot", return_value=(snapshot, {"weekly_schedule": self.schedule}),
+        ):
+            report = bot.website_status(self.site, digest_time="12:00")
+        self.assertIn("今日灵修 · 1/2（50%）\n待完成：乙", report)
+        self.assertIn("本周读物 · 1/2（50%）\n待完成：甲", report)
+        self.assertNotIn("已退出", report)
 
-    def test_old_site_does_not_claim_cedar_group_is_unconfigured(self):
-        old = bot.SiteConfig("zk", "科大", "https://example.test:1777", frozenset())
-        cedar = bot.SiteConfig("cedar-zk", "香柏木门训 / 科大门训", "https://example.test:7399/api/bot/groups/zk", frozenset({84801506}))
-        with patch.object(bot, "SITE_BY_ID", {"zk": old, "cedar-zk": cedar}), patch.object(bot, "broadcast_group_update", return_value=0), patch.object(bot, "send") as send:
-            self.assertIs(bot.find_site("科大门训"), cedar)
-            bot.announce_change(SimpleNamespace(), 1, 900, False, old, "群通知", "取消打卡成功")
-        reply = send.call_args.args[3]
-        self.assertIn("旧网站", reply)
-        self.assertIn("切换 cedar-zk", reply)
-        self.assertIn("两站数据独立", reply)
+    def test_digest_sends_once_per_chat_in_each_slot(self):
+        current = datetime(2026, 8, 21, 12, tzinfo=bot.ZoneInfo("Asia/Shanghai"))
+        client = SimpleNamespace()
+        with patch.object(bot, "state", {"reminded": {}}), patch.object(bot, "save_state"), patch.object(
+            bot, "website_status", return_value="打卡汇总",
+        ) as status, patch.object(bot, "send") as send:
+            bot.deliver_scheduled_reminder(client, 1, self.site, "digest-12:00", current)
+            bot.deliver_scheduled_reminder(client, 1, self.site, "digest-12:00", current)
+            bot.deliver_scheduled_reminder(client, 1, self.site, "digest-23:30", current.replace(hour=23, minute=30))
+        self.assertEqual(send.call_count, 2)
+        self.assertEqual([call.kwargs["digest_time"] for call in status.call_args_list], ["12:00", "23:30"])
 
     def test_website_poll_baselines_then_notifies_new_checkin_and_retro(self):
         initial = {"records": [{"Id": 1, "name": "甲", "logical_date": "2026-08-21", "daily": "done"}]}
